@@ -19,6 +19,11 @@ const POLL: Duration = Duration::from_secs(10);
 /// First wait after HTTP 429, doubling while it persists.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// Position reports older than this are dropped, and tracks expire once
+/// their last report is this old.
+pub const MAX_AGE: Duration = Duration::from_secs(120);
+/// Ground speeds above this are bad data, not aircraft.
+const MAX_GS: f32 = 2000.0;
 /// Stop fetching once the radar has been off screen this long.
 const IDLE: Duration = Duration::from_secs(20);
 
@@ -199,14 +204,22 @@ fn parse(body: &str, now: Instant) -> Result<Vec<Aircraft>> {
             };
             let squawk_emergency = matches!(e.squawk.as_deref(), Some("7500" | "7600" | "7700"));
             let flagged = e.emergency.as_deref().is_some_and(|s| s != "none");
-            let age = Duration::from_secs_f32(e.seen_pos.unwrap_or(0.0).clamp(0.0, 60.0));
+            let (lat, lon) = (e.lat?, e.lon?);
+            if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                return None;
+            }
+            let seen = e.seen_pos.filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
+            if seen > MAX_AGE.as_secs_f32() {
+                return None;
+            }
+            let age = Duration::from_secs_f32(seen);
             Some(Aircraft {
-                lat: e.lat?,
-                lon: e.lon?,
+                lat,
+                lon,
                 ident,
                 alt,
-                gs: e.gs,
-                track: e.track,
+                gs: e.gs.filter(|g| (0.0..=MAX_GS).contains(g)),
+                track: e.track.filter(|t| t.is_finite()),
                 vrate: e.baro_rate.or(e.geom_rate),
                 emergency: squawk_emergency || flagged,
                 fixed_at: now.checked_sub(age).unwrap_or(now),
@@ -230,10 +243,16 @@ mod tests {
              "lat":63.977,"lon":-21.634},
             {"hex":"4cc2aa","type":"adsb_icao","alt_baro":"ground","squawk":"7700",
              "lat":63.985,"lon":-22.6},
-            {"hex":"abcdef","type":"mlat"}
+            {"hex":"abcdef","type":"mlat"},
+            {"hex":"bad001","type":"adsb_icao","lat":1e38,"lon":-22.0},
+            {"hex":"bad002","type":"adsb_icao","lat":64.0,"lon":-22.0,"seen_pos":180},
+            {"hex":"bad003","type":"adsb_icao","lat":64.0,"lon":-22.0,"gs":1e30,"track":90}
         ]}"#;
         let ac = parse(body, Instant::now()).unwrap();
-        assert_eq!(ac.len(), 2);
+        // Out-of-range coordinates and expired positions are dropped; an
+        // impossible speed is discarded but the position kept.
+        assert_eq!(ac.len(), 3);
+        assert_eq!((ac[2].hex.as_str(), ac[2].gs), ("bad003", None));
         assert_eq!((ac[0].ident.as_str(), ac[0].alt), ("ICE27Y", Some(1075)));
         assert_eq!(ac[0].vrate, Some(-576));
         assert!(!ac[0].emergency);

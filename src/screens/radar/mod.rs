@@ -45,8 +45,6 @@ const FRAME: Duration = Duration::from_millis(66);
 const HISTORY: usize = 8;
 /// Dead reckoning stops this long after the last position report.
 const MAX_EXTRAPOLATION: f32 = 30.0;
-/// Aircraft not heard from for this long leave the scope.
-const MAX_AGE: Duration = Duration::from_secs(120);
 /// Velocity vector length.
 const VECTOR_SECS: f32 = 60.0;
 
@@ -125,8 +123,11 @@ impl Radar {
 
     /// The sweep's bearing now, degrees clockwise from north.
     fn beam(&self) -> f32 {
-        let t = (self.now - self.started).as_secs_f32() / SWEEP.as_secs_f32();
-        t.fract() * 360.0
+        // Wrap in integer time first: uptime as an f32 loses the precision
+        // a smooth sweep needs after a few days.
+        let sweep = SWEEP.as_millis();
+        let phase = (self.now - self.started).as_millis() % sweep;
+        phase as f32 / sweep as f32 * 360.0
     }
 }
 
@@ -175,7 +176,7 @@ impl Screen for Radar {
         let mut targets: Vec<(&Track, (f32, f32))> = self
             .tracks
             .values()
-            .filter(|t| self.now.saturating_duration_since(t.ac.fixed_at) < MAX_AGE)
+            .filter(|t| self.now.saturating_duration_since(t.ac.fixed_at) < adsb::MAX_AGE)
             .map(|t| (t, dead_reckon(&t.ac, self.now)))
             .filter(|(_, pos)| in_scope(project(*pos)))
             .collect();
@@ -476,12 +477,9 @@ fn draw_track(
         let age = (track.history.len() - i) as f32 / (HISTORY as f32 + 1.0);
         let c = mix(p.backdrop, base, 0.65 * (1.0 - age));
         let (hx, hy) = project(old);
-        px.fill_rect(
-            tiny_skia::Rect::from_xywh(hx - 1.5, hy - 1.5, 3.0, 3.0).unwrap(),
-            &paint(c, 255),
-            Transform::identity(),
-            Some(scope),
-        );
+        if let Some(rect) = tiny_skia::Rect::from_xywh(hx - 1.5, hy - 1.5, 3.0, 3.0) {
+            px.fill_rect(rect, &paint(c, 255), Transform::identity(), Some(scope));
+        }
     }
     if let (Some(gs), Some(trk)) = (ac.gs, ac.track) {
         let tip = project(ahead(pos.0, pos.1, gs, trk, VECTOR_SECS));
@@ -501,7 +499,9 @@ fn draw_track(
     dot(px, (x, y), 6.0, base, (110.0 * fade) as u8);
     let s = 4.0;
     let mut pb = PathBuilder::new();
-    pb.push_rect(tiny_skia::Rect::from_xywh(x - s, y - s, 2.0 * s, 2.0 * s).unwrap());
+    if let Some(rect) = tiny_skia::Rect::from_xywh(x - s, y - s, 2.0 * s, 2.0 * s) {
+        pb.push_rect(rect);
+    }
     if let Some(path) = pb.finish() {
         let stroke = Stroke {
             width: 1.8,
