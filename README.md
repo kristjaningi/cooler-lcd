@@ -6,8 +6,8 @@ and font of the active Omarchy theme, and follows theme switches live. The
 screens are:
 
 - `dashboard`: the clock, date, and CPU and GPU temperature.
-- `usage`: Claude and Codex plan usage as ring gauges, with time until each
-  limit resets.
+- `usage`: Claude Code and Codex plan usage as horizontal bars, with a pace
+  marker and the time until each limit resets.
 
 A lightweight replacement for TRCC: ~0.1% CPU and ~33 MB of memory (most of
 that is NVIDIA's NVML library, loaded for the GPU temperature).
@@ -28,16 +28,14 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
   sans (`src/theme.rs`).
-- **Claude usage:** fetched every 5 minutes on a background thread from the
-  OAuth usage endpoint that Claude Code's `/usage` uses, with the token Claude
-  Code keeps in `~/.claude/.credentials.json` (sent only to
-  api.anthropic.com). The endpoint is undocumented, so failures are soft:
-  errors and HTTP 429 back off up to an hour, an expired or rejected token is
-  never retried until Claude Code refreshes it, and old numbers are dimmed
-  with their age (`src/screens/usage/claude.rs`).
-- **Codex usage:** read from the newest local session log in
-  `~/.codex/sessions/`, which records the account's rate limits on every
-  reply. No network; updates after you use Codex (`src/screens/usage/codex.rs`).
+- **Plan usage:** read from the records Omarchy's Agents bar widget
+  (`omarchy.agents`) writes to `~/.local/state/omarchy/agents/usage/`, one
+  JSON file per agent, re-read whenever one changes. No network and no
+  credentials of its own; the numbers are as fresh as the bar's (every 15
+  minutes by default, `omarchy bar set omarchy.agents refreshIntervalSec 300
+  --json` for 5). Each bar's notch marks where an even spend across the
+  window would be by now, and records older than 45 minutes are dimmed with
+  their age (`src/screens/usage.rs`).
 - **Recovery:** reconnects when the cooler is unplugged or a write fails, and
   after suspend (detected as the wall clock jumping ahead of the monotonic
   clock).
