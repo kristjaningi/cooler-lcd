@@ -1,9 +1,9 @@
 # cooler-lcd
 
-A tiny dashboard for the LCD on Thermalright Vision coolers (USB `87ad:70db`,
-e.g. Phantom Spirit 120 Vision). Shows the clock, date, CPU and GPU temperature
-in the colors and font of the active Omarchy theme, and follows theme switches
-live.
+A tiny driver for the LCD on Thermalright Vision coolers (USB `87ad:70db`,
+e.g. Phantom Spirit 120 Vision). It cycles through screens drawn in the colors
+and font of the active Omarchy theme, and follows theme switches live. The
+built-in `dashboard` screen shows the clock, date, and CPU and GPU temperature.
 
 A lightweight replacement for TRCC: ~0.1% CPU and ~33 MB of memory (most of
 that is NVIDIA's NVML library, loaded for the GPU temperature).
@@ -14,12 +14,13 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
   64-byte header + JPEG sent over USB bulk (`src/device.rs`). The firmware
   falls back to the Thermalright logo after ~2-3 s without a frame, so the last
   frame is resent every second.
-- **Rendering:** the background and cards are drawn once per theme; the text
-  is redrawn and re-encoded only when the minute, a temperature or the theme
-  changes (`src/render.rs`).
+- **Screens:** each screen in `src/screens/` gathers its own data and draws
+  itself with the helpers in `src/draw.rs`. A frame is redrawn and re-encoded
+  only when the screen reports a change, the theme changes, or the next screen
+  rotates in (`src/render.rs`).
 - **Sensors:** CPU from hwmon (`k10temp` Tdie/Tctl, `coretemp`), GPU from
   NVML, polled every 3 s. Missing sensors are retried every 30 s
-  (`src/stats.rs`).
+  (`src/screens/sensors.rs`).
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
   sans (`src/theme.rs`).
@@ -30,13 +31,32 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
 ## Run
 
 ```sh
-cargo run --release                          # drive the screen
-cargo run --release -- --preview out.jpg     # render one frame to a file
-cargo test                                   # unit tests
+cargo run --release                                        # drive the screen
+cargo run --release -- --preview out.jpg                   # render one frame to a file
+cargo run --release -- --screen dashboard --preview out.jpg  # preview a specific screen
+cargo test                                                 # unit tests
 ```
 
 Only one program can use the screen at a time, so stop the service (or TRCC,
 with `trcc kill`) first.
+
+## Config
+
+Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
+
+```toml
+screens = ["dashboard"]   # shown in order
+rotate_seconds = 15       # time per screen when more than one is listed
+```
+
+Restart the service after editing it. A broken config is logged and the
+defaults are used.
+
+## Adding a screen
+
+Implement the `Screen` trait in a new module under `src/screens/` and register
+it in `build()` and `NAMES` in `src/screens/mod.rs`. `update()` runs inside the
+frame loop, so fetch anything slow (network, big files) on a background thread.
 
 ## Install
 

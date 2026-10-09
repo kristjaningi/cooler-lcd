@@ -1,0 +1,8 @@
+# cooler-lcd config. Copy to ~/.config/cooler-lcd/config.toml.
+# Every setting is optional; these are the defaults.
+
+# Screens to show, in order. Available: dashboard
+screens = ["dashboard"]
+
+# Seconds each screen stays up when more than one is listed.
+rotate_seconds = 15

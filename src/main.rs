@@ -1,24 +1,29 @@
-//! cooler-lcd: drives the LCD on Thermalright Vision coolers with a small
-//! dashboard (clock, date, CPU and GPU temperature) in Omarchy theme colors.
+//! cooler-lcd: drives the LCD on Thermalright Vision coolers with screens
+//! (clock, temperatures, ...) drawn in Omarchy theme colors.
 //!
 //! Usage:
-//!   cooler-lcd                  run, updating the screen every second
-//!   cooler-lcd --preview FILE   render one frame to a JPEG file and exit
+//!   cooler-lcd [--screen NAME]                  run, cycling through the configured screens
+//!   cooler-lcd [--screen NAME] --preview FILE   render one frame to a JPEG file and exit
+//!
+//! `--screen` shows just that screen instead of the config's list.
 
+mod config;
 mod device;
+mod draw;
 mod render;
-mod stats;
+mod screens;
 mod theme;
 
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Local;
 
+use config::Config;
 use device::{HEADER_LEN, Panel};
-use render::{Renderer, Snapshot};
-use stats::Sensors;
+use render::Renderer;
+use screens::Screen;
 use theme::Theme;
 
 /// The panel shows its own logo after ~2-3 s without a frame, so resend often.
@@ -30,19 +35,32 @@ const WAKE_GAP: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut sensors = Sensors::new();
-    let mut theme = Theme::load(false)?;
-    let mut renderer = Renderer::new(&theme);
+    let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
+    let mut log = Log::default();
 
-    if let Some(i) = args.iter().position(|a| a == "--preview") {
-        let path = args.get(i + 1).map_or("preview.jpg", String::as_str);
-        renderer.update(&theme, &snapshot(&mut sensors))?;
+    let config = Config::load().unwrap_or_else(|e| {
+        log.error(format!("{e:#}; using defaults"));
+        Config::default()
+    });
+    let names = match flag("--screen") {
+        Some(Some(name)) => vec![name.clone()],
+        Some(None) => bail!("--screen needs a name: {}", screens::NAMES.join(", ")),
+        None => config.screens.clone(),
+    };
+    let mut carousel = Carousel::new(&names, config.rotate(), &mut log)?;
+    let mut theme = Theme::load(false)?;
+    let mut renderer = Renderer::new();
+
+    if let Some(path) = flag("--preview") {
+        let path = path.map_or("preview.jpg", String::as_str);
+        let screen = carousel.current();
+        screen.update(Local::now());
+        renderer.render(screen.as_ref(), &theme)?;
         std::fs::write(path, &renderer.frame()[HEADER_LEN..])?;
         println!("wrote {path}");
         return Ok(());
     }
 
-    let mut log = Log::default();
     let mut theme_mtime = theme::colors_mtime();
     loop {
         let mut panel = match Panel::open() {
@@ -56,6 +74,7 @@ fn main() -> Result<()> {
         log.info(format!("connected to screen (PM={})", panel.pm));
 
         let mut clocks = (SystemTime::now(), Instant::now());
+        let mut dirty = true;
         loop {
             let tick = Instant::now();
 
@@ -74,16 +93,23 @@ fn main() -> Result<()> {
                 match Theme::load(true) {
                     Ok(t) => {
                         theme = t;
-                        renderer.set_theme(&theme);
                         theme_mtime = mtime;
+                        dirty = true;
                     }
                     Err(e) => log.error(format!("reloading theme: {e:#}")),
                 }
             }
 
-            // On a render error, keep showing the previous frame.
-            if let Err(e) = renderer.update(&theme, &snapshot(&mut sensors)) {
-                log.error(format!("rendering: {e:#}"));
+            dirty |= carousel.advance();
+            let screen = carousel.current();
+            dirty |= screen.update(Local::now());
+
+            // On a render error, keep showing the previous frame and retry next tick.
+            if dirty {
+                match renderer.render(screen.as_ref(), &theme) {
+                    Ok(()) => dirty = false,
+                    Err(e) => log.error(format!("rendering: {e:#}")),
+                }
             }
             if !renderer.frame().is_empty()
                 && let Err(e) = panel.send(renderer.frame())
@@ -97,12 +123,49 @@ fn main() -> Result<()> {
     }
 }
 
-fn snapshot(sensors: &mut Sensors) -> Snapshot {
-    let (cpu_temp, gpu_temp) = sensors.temps();
-    Snapshot {
-        now: Local::now(),
-        cpu_temp,
-        gpu_temp,
+/// The configured screens, shown one at a time for `rotate` each.
+struct Carousel {
+    screens: Vec<Box<dyn Screen>>,
+    index: usize,
+    shown_at: Instant,
+    rotate: Duration,
+}
+
+impl Carousel {
+    fn new(names: &[String], rotate: Duration, log: &mut Log) -> Result<Self> {
+        let mut screens = Vec::new();
+        for name in names {
+            match screens::build(name) {
+                Some(s) => screens.push(s),
+                None => log.error(format!(
+                    "unknown screen {name:?} (available: {})",
+                    screens::NAMES.join(", ")
+                )),
+            }
+        }
+        if screens.is_empty() {
+            bail!("no usable screens configured");
+        }
+        Ok(Self {
+            screens,
+            index: 0,
+            shown_at: Instant::now(),
+            rotate,
+        })
+    }
+
+    /// Moves to the next screen when its time is up. Returns true on a switch.
+    fn advance(&mut self) -> bool {
+        if self.screens.len() < 2 || self.shown_at.elapsed() < self.rotate {
+            return false;
+        }
+        self.index = (self.index + 1) % self.screens.len();
+        self.shown_at = Instant::now();
+        true
+    }
+
+    fn current(&mut self) -> &mut Box<dyn Screen> {
+        &mut self.screens[self.index]
     }
 }
 
