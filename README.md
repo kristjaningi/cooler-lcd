@@ -61,3 +61,7 @@ journalctl --user -u cooler-lcd                              # logs
 cargo install --path . && systemctl --user restart cooler-lcd # deploy changes
 systemctl --user stop cooler-lcd                             # hand the screen back to TRCC
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
