@@ -3,7 +3,11 @@
 A tiny driver for the LCD on Thermalright Vision coolers (USB `87ad:70db`,
 e.g. Phantom Spirit 120 Vision). It cycles through screens drawn in the colors
 and font of the active Omarchy theme, and follows theme switches live. The
-built-in `dashboard` screen shows the clock, date, and CPU and GPU temperature.
+screens are:
+
+- `dashboard`: the clock, date, and CPU and GPU temperature.
+- `usage`: Claude and Codex plan usage as ring gauges, with time until each
+  limit resets.
 
 A lightweight replacement for TRCC: ~0.1% CPU and ~33 MB of memory (most of
 that is NVIDIA's NVML library, loaded for the GPU temperature).
@@ -24,6 +28,16 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
   sans (`src/theme.rs`).
+- **Claude usage:** fetched every 5 minutes on a background thread from the
+  OAuth usage endpoint that Claude Code's `/usage` uses, with the token Claude
+  Code keeps in `~/.claude/.credentials.json` (sent only to
+  api.anthropic.com). The endpoint is undocumented, so failures are soft:
+  errors and HTTP 429 back off up to an hour, an expired or rejected token is
+  never retried until Claude Code refreshes it, and old numbers are dimmed
+  with their age (`src/screens/usage/claude.rs`).
+- **Codex usage:** read from the newest local session log in
+  `~/.codex/sessions/`, which records the account's rate limits on every
+  reply. No network; updates after you use Codex (`src/screens/usage/codex.rs`).
 - **Recovery:** reconnects when the cooler is unplugged or a write fails, and
   after suspend (detected as the wall clock jumping ahead of the monotonic
   clock).
@@ -45,7 +59,7 @@ with `trcc kill`) first.
 Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 
 ```toml
-screens = ["dashboard"]   # shown in order
+screens = ["dashboard", "usage"]   # shown in order
 rotate_seconds = 15       # time per screen when more than one is listed
 ```
 

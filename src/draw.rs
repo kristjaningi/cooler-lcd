@@ -2,7 +2,7 @@
 //! so tiny-skia's premultiplied RGBA is plain RGBA.
 
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::theme::Rgb;
 
@@ -86,4 +86,52 @@ pub fn text(
             }
         });
     }
+}
+
+/// A ring gauge: a full `track` circle with a `color` arc over it, starting
+/// at 12 o'clock and running clockwise for `fraction` (0..=1) of the circle.
+#[allow(clippy::too_many_arguments)]
+pub fn ring(
+    px: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    width: f32,
+    fraction: f32,
+    color: Rgb,
+    track: Rgb,
+) {
+    let stroke = Stroke {
+        width,
+        line_cap: LineCap::Round,
+        ..Stroke::default()
+    };
+    if let Some(circle) = PathBuilder::from_circle(cx, cy, r) {
+        px.stroke_path(&circle, &paint(track), &stroke, Transform::identity(), None);
+    }
+    if fraction <= 0.0 {
+        return;
+    }
+    let sweep = fraction.min(1.0) * std::f32::consts::TAU;
+    let steps = (sweep * 24.0).ceil() as usize;
+    let mut pb = PathBuilder::new();
+    for i in 0..=steps {
+        let a = -std::f32::consts::FRAC_PI_2 + sweep * i as f32 / steps as f32;
+        let (x, y) = (cx + r * a.cos(), cy + r * a.sin());
+        if i == 0 {
+            pb.move_to(x, y)
+        } else {
+            pb.line_to(x, y)
+        }
+    }
+    if let Some(arc) = pb.finish() {
+        px.stroke_path(&arc, &paint(color), &stroke, Transform::identity(), None);
+    }
+}
+
+fn paint(color: Rgb) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.0, color.1, color.2, 255);
+    paint.anti_alias = true;
+    paint
 }

@@ -8,6 +8,7 @@
 
 mod dashboard;
 mod sensors;
+mod usage;
 
 use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
@@ -24,11 +25,12 @@ pub trait Screen {
 }
 
 /// Names accepted in the config's `screens` list.
-pub const NAMES: &[&str] = &["dashboard"];
+pub const NAMES: &[&str] = &["dashboard", "usage"];
 
 pub fn build(name: &str) -> Option<Box<dyn Screen>> {
     match name {
         "dashboard" => Some(Box::new(dashboard::Dashboard::new())),
+        "usage" => Some(Box::new(usage::Usage::new())),
         _ => None,
     }
 }

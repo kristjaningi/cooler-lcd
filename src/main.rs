@@ -55,6 +55,13 @@ fn main() -> Result<()> {
         let path = path.map_or("preview.jpg", String::as_str);
         let screen = carousel.current();
         screen.update(Local::now());
+        // Give background fetchers (network data) a moment to deliver.
+        for _ in 0..30 {
+            sleep(Duration::from_millis(100));
+            if screen.update(Local::now()) {
+                break;
+            }
+        }
         renderer.render(screen.as_ref(), &theme)?;
         std::fs::write(path, &renderer.frame()[HEADER_LEN..])?;
         println!("wrote {path}");
