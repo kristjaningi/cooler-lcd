@@ -1,0 +1,11 @@
+[Unit]
+Description=Thermalright Vision cooler screen dashboard
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=%h/.cargo/bin/cooler-lcd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

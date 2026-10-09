@@ -1,0 +1,14 @@
+[package]
+name = "cooler-lcd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+chrono = "0.4"
+jpeg-encoder = "0.7"
+nusb = "0.2"
+nvml-wrapper = "0.13"
+tiny-skia = "0.12"
+toml = "1"

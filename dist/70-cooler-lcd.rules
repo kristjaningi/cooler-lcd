@@ -1,0 +1,6 @@
+# Thermalright Vision cooler screen (ChiZhu USBDISPLAY).
+# Numbered below 73 so the uaccess tag is in place when 73-seat-late.rules
+# grants the logged-in user access.
+SUBSYSTEM=="usb", ATTR{idVendor}=="87ad", ATTR{idProduct}=="70db", TAG+="uaccess"
+# Keep USB autosuspend off; the panel needs a steady stream of frames.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="87ad", ATTR{idProduct}=="70db", ATTR{power/control}="on"
