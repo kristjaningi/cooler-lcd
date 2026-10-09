@@ -7,8 +7,11 @@
 //! panel falls back to its logo after ~2-3 s without a frame.
 
 mod dashboard;
+mod radar;
 mod sensors;
 mod usage;
+
+use std::time::Duration;
 
 use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
@@ -22,15 +25,28 @@ pub trait Screen {
 
     /// Draws the whole 480x480 picture.
     fn draw(&self, px: &mut Pixmap, theme: &Theme);
+
+    /// Time between frames while this screen is up. Animated screens ask for
+    /// less than the default second.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    /// True while the first data is still on its way, so `--preview` can
+    /// wait for it instead of capturing an empty screen.
+    fn loading(&self) -> bool {
+        false
+    }
 }
 
 /// Names accepted in the config's `screens` list.
-pub const NAMES: &[&str] = &["dashboard", "usage"];
+pub const NAMES: &[&str] = &["dashboard", "usage", "radar"];
 
 pub fn build(name: &str) -> Option<Box<dyn Screen>> {
     match name {
         "dashboard" => Some(Box::new(dashboard::Dashboard::new())),
         "usage" => Some(Box::new(usage::Usage::new())),
+        "radar" => Some(Box::new(radar::Radar::new())),
         _ => None,
     }
 }

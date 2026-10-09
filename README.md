@@ -8,9 +8,14 @@ screens are:
 - `dashboard`: the clock, date, and CPU and GPU temperature.
 - `usage`: Claude Code and Codex plan usage as horizontal bars, with a pace
   marker and the time until each limit resets.
+- `radar`: a surveillance radar scope over Reykjavik and Keflavik with live
+  air traffic: a rotating sweep, range rings, the coastline and runways, and
+  each aircraft with its history trail, velocity vector and data block
+  (callsign, altitude in hundreds of feet, climb/descent, ground speed).
 
-A lightweight replacement for TRCC: ~0.1% CPU and ~33 MB of memory (most of
-that is NVIDIA's NVML library, loaded for the GPU temperature).
+A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~6% of
+one core while the animated radar is up, and ~35 MB of memory (most of that
+is NVIDIA's NVML library, loaded for the GPU temperature).
 
 ## How it works
 
@@ -21,7 +26,8 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
 - **Screens:** each screen in `src/screens/` gathers its own data and draws
   itself with the helpers in `src/draw.rs`. A frame is redrawn and re-encoded
   only when the screen reports a change, the theme changes, or the next screen
-  rotates in (`src/render.rs`).
+  rotates in (`src/render.rs`). Still screens run at one frame a second;
+  animated ones set their own `interval()`.
 - **Sensors:** CPU from hwmon (`k10temp` Tdie/Tctl, `coretemp`), GPU from
   NVML, polled every 3 s. Missing sensors are retried every 30 s
   (`src/screens/sensors.rs`).
@@ -36,6 +42,12 @@ that is NVIDIA's NVML library, loaded for the GPU temperature).
   --json` for 5). Each bar's notch marks where an even spend across the
   window would be by now, and records older than 45 minutes are dimmed with
   their age (`src/screens/usage.rs`).
+- **Radar:** aircraft from [adsb.lol](https://adsb.lol)'s free API (community
+  ADS-B receivers, no key), polled every 10 s only while the radar is on
+  screen, backing off on errors and HTTP 429. Positions are dead reckoned
+  between polls, so blips glide at the 15 fps animation rate. The static
+  scope, rings and map are drawn once per theme. Coastline from Natural
+  Earth, runways from OurAirports (`src/screens/radar/`).
 - **Recovery:** reconnects when the cooler is unplugged or a write fails, and
   after suspend (detected as the wall clock jumping ahead of the monotonic
   clock).
@@ -57,7 +69,7 @@ with `trcc kill`) first.
 Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 
 ```toml
-screens = ["dashboard", "usage"]   # shown in order
+screens = ["dashboard", "usage", "radar"]   # shown in order
 rotate_seconds = 15       # time per screen when more than one is listed
 ```
 

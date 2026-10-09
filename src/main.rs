@@ -26,8 +26,6 @@ use render::Renderer;
 use screens::Screen;
 use theme::Theme;
 
-/// The panel shows its own logo after ~2-3 s without a frame, so resend often.
-const INTERVAL: Duration = Duration::from_secs(1);
 const RETRY: Duration = Duration::from_secs(3);
 /// Wall clock running this far ahead of the monotonic clock means we slept;
 /// the USB handle may be stale, so reconnect.
@@ -56,11 +54,12 @@ fn main() -> Result<()> {
         let screen = carousel.current();
         screen.update(Local::now());
         // Give background fetchers (network data) a moment to deliver.
-        for _ in 0..30 {
-            sleep(Duration::from_millis(100));
-            if screen.update(Local::now()) {
+        for _ in 0..50 {
+            if !screen.loading() {
                 break;
             }
+            sleep(Duration::from_millis(100));
+            screen.update(Local::now());
         }
         renderer.render(screen.as_ref(), &theme)?;
         std::fs::write(path, &renderer.frame()[HEADER_LEN..])?;
@@ -125,7 +124,9 @@ fn main() -> Result<()> {
                 break;
             }
 
-            sleep(INTERVAL.saturating_sub(tick.elapsed()));
+            // The panel shows its own logo after ~2-3 s without a frame, so
+            // even a still screen is resent every second.
+            sleep(screen.interval().saturating_sub(tick.elapsed()));
         }
     }
 }
