@@ -48,6 +48,14 @@ const MAX_EXTRAPOLATION: f32 = 30.0;
 /// Velocity vector length.
 const VECTOR_SECS: f32 = 60.0;
 
+/// Icelandair's ICAO callsign prefix.
+const ICELANDAIR: &str = "ICE";
+/// Icelandair gold, fixed rather than themed so the flag carrier always
+/// stands out from the phosphor.
+const GOLD: Rgb = Rgb(255, 184, 28);
+/// One beacon pulse around each Icelandair aircraft.
+const PULSE: Duration = Duration::from_millis(1800);
+
 const AIRPORTS: &[(&str, (f32, f32))] = &[("KEF", (63.985, -22.6056)), ("RVK", (64.13, -21.9406))];
 
 struct Track {
@@ -129,6 +137,21 @@ impl Radar {
         let phase = (self.now - self.started).as_millis() % sweep;
         phase as f32 / sweep as f32 * 360.0
     }
+
+    /// How far through its current beacon pulse an Icelandair blip is, 0..1.
+    fn pulse(&self) -> f32 {
+        let pulse = PULSE.as_millis();
+        let phase = (self.now - self.started).as_millis() % pulse;
+        phase as f32 / pulse as f32
+    }
+}
+
+/// Whether a callsign is an Icelandair flight ("ICE614"), not just one that
+/// happens to start with the letters.
+fn is_icelandair(ident: &str) -> bool {
+    ident
+        .strip_prefix(ICELANDAIR)
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 impl Screen for Radar {
@@ -180,18 +203,31 @@ impl Screen for Radar {
             .map(|t| (t, dead_reckon(&t.ac, self.now)))
             .filter(|(_, pos)| in_scope(project(*pos)))
             .collect();
-        // Ground traffic first, so airborne blips and their labels sit on top.
-        targets.sort_by_key(|(t, _)| (t.ac.alt.is_some(), t.ac.emergency));
+        // Ground traffic first, so airborne blips and their labels sit on
+        // top, with Icelandair above the rest and emergencies above all.
+        targets.sort_by_key(|(t, _)| {
+            (
+                t.ac.alt.is_some(),
+                t.ac.emergency,
+                is_icelandair(&t.ac.ident),
+            )
+        });
+        let pulse = self.pulse();
         for (track, pos) in &targets {
-            draw_track(px, &p, &self.scope, track, *pos, beam);
+            draw_track(px, &p, &self.scope, track, *pos, beam, pulse);
         }
 
         let airborne = targets.iter().filter(|(t, _)| t.ac.alt.is_some()).count();
+        let icelandair = targets
+            .iter()
+            .filter(|(t, _)| t.ac.alt.is_some() && is_icelandair(&t.ac.ident))
+            .count();
         draw_hud(
             px,
             &p,
             self.status,
             airborne,
+            icelandair,
             self.utc,
             self.now - self.started,
         );
@@ -457,19 +493,28 @@ fn draw_track(
     track: &Track,
     pos: (f32, f32),
     beam: f32,
+    pulse: f32,
 ) {
     let ac = &track.ac;
     let (x, y) = project(pos);
+    let ice = is_icelandair(&ac.ident) && !ac.emergency;
     // Brightest just after the beam passes, fading until the next pass.
+    // Icelandair stays near full brightness all the way round.
     let bearing = (x - C).atan2(C - y).to_degrees().rem_euclid(360.0);
     let since = (beam - bearing).rem_euclid(360.0) / 360.0;
-    let fade = 1.0 - 0.6 * since;
-    let base = if ac.emergency { p.alert } else { p.phosphor };
+    let fade = 1.0 - if ice { 0.25 } else { 0.6 } * since;
+    let base = match (ac.emergency, ice) {
+        (true, _) => p.alert,
+        (_, true) => GOLD,
+        _ => p.phosphor,
+    };
     let lit = mix(p.backdrop, base, fade);
 
     if ac.alt.is_none() && !ac.emergency {
-        // On the ground: a dim dot, no label.
-        dot(px, (x, y), 2.5, mix(p.backdrop, base, 0.5 * fade), 255);
+        // On the ground: a dim dot, no label; Icelandair's a little bigger,
+        // so its fleet at the gates shows up in gold.
+        let (r, level) = if ice { (3.5, 0.8) } else { (2.5, 0.5) };
+        dot(px, (x, y), r, mix(p.backdrop, base, level * fade), 255);
         return;
     }
 
@@ -494,26 +539,32 @@ fn draw_track(
         );
     }
 
-    // Halo, then a square target symbol.
-    dot(px, (x, y), 11.0, base, (70.0 * fade) as u8);
-    dot(px, (x, y), 6.0, base, (110.0 * fade) as u8);
-    let s = 4.0;
-    let mut pb = PathBuilder::new();
-    if let Some(rect) = tiny_skia::Rect::from_xywh(x - s, y - s, 2.0 * s, 2.0 * s) {
-        pb.push_rect(rect);
-    }
-    if let Some(path) = pb.finish() {
-        let stroke = Stroke {
-            width: 1.8,
-            ..Stroke::default()
-        };
-        px.stroke_path(
-            &path,
-            &paint(mix(lit, Rgb(255, 255, 255), 0.4 * fade), 255),
-            &stroke,
-            Transform::identity(),
-            None,
+    if ice {
+        // A beacon ring expanding and fading out, then the halo and an
+        // airliner pointing along its track.
+        let eased = 1.0 - (1.0 - pulse).powi(2);
+        ring(
+            px,
+            (x, y),
+            8.0 + 18.0 * eased,
+            1.6,
+            GOLD,
+            (200.0 * (1.0 - pulse)) as u8,
         );
+        dot(px, (x, y), 14.0, GOLD, (60.0 * fade) as u8);
+        dot(px, (x, y), 8.0, GOLD, (90.0 * fade) as u8);
+        airliner(
+            px,
+            (x, y),
+            ac.track.unwrap_or(0.0),
+            mix(GOLD, Rgb(255, 255, 255), 0.25),
+            p.backdrop,
+        );
+    } else {
+        // Halo, then a square target symbol.
+        dot(px, (x, y), 11.0, base, (70.0 * fade) as u8);
+        dot(px, (x, y), 6.0, base, (110.0 * fade) as u8);
+        target(px, (x, y), mix(lit, Rgb(255, 255, 255), 0.4 * fade));
     }
 
     // Data block behind the aircraft, clear of its velocity vector, unless
@@ -539,7 +590,11 @@ fn draw_track(
         255,
         None,
     );
-    let ident_color = if ac.emergency { p.alert } else { p.hot };
+    let ident_color = match (ac.emergency, ice) {
+        (true, _) => p.alert,
+        (_, true) => GOLD,
+        _ => p.hot,
+    };
     text_aligned(
         px,
         &p.theme.font,
@@ -560,6 +615,56 @@ fn draw_track(
         lit,
         align,
     );
+}
+
+/// A square target symbol, the mark for ordinary traffic.
+fn target(px: &mut Pixmap, (x, y): (f32, f32), c: Rgb) {
+    let s = 4.0;
+    let Some(rect) = tiny_skia::Rect::from_xywh(x - s, y - s, 2.0 * s, 2.0 * s) else {
+        return;
+    };
+    let path = PathBuilder::from_rect(rect);
+    let stroke = Stroke {
+        width: 1.8,
+        ..Stroke::default()
+    };
+    px.stroke_path(&path, &paint(c, 255), &stroke, Transform::identity(), None);
+}
+
+/// A top-down airliner centered on the point, nose along `track` degrees,
+/// outlined in `edge` so it reads over the halo.
+fn airliner(px: &mut Pixmap, (x, y): (f32, f32), track: f32, fill: Rgb, edge: Rgb) {
+    // The right half, nose up, from nose to tail; mirrored for the left.
+    const HALF: &[(f32, f32)] = &[
+        (0.0, -11.0),
+        (1.3, -9.5),
+        (1.5, -3.0),
+        (10.0, 2.5),
+        (10.0, 4.2),
+        (1.5, 1.8),
+        (1.2, 6.8),
+        (4.5, 9.2),
+        (4.5, 10.6),
+        (0.0, 9.6),
+    ];
+    let mut pb = PathBuilder::new();
+    pb.move_to(HALF[0].0, HALF[0].1);
+    for &(hx, hy) in &HALF[1..] {
+        pb.line_to(hx, hy);
+    }
+    for &(hx, hy) in HALF[1..HALF.len() - 1].iter().rev() {
+        pb.line_to(-hx, hy);
+    }
+    pb.close();
+    let Some(path) = pb.finish() else { return };
+    let at = Transform::from_rotate(track).post_translate(x, y);
+    let stroke = Stroke {
+        width: 2.0,
+        line_join: tiny_skia::LineJoin::Round,
+        ..Stroke::default()
+    };
+    px.stroke_path(&path, &paint(edge, 255), &stroke, at, None);
+    px.fill_path(&path, &paint(fill, 255), FillRule::Winding, at, None);
 }
 
 /// "035↓ 102": altitude in hundreds of feet, climb or descent, ground speed.
@@ -589,6 +694,7 @@ fn draw_hud(
     p: &Palette,
     status: Status,
     airborne: usize,
+    icelandair: usize,
     utc: DateTime<Utc>,
     up: Duration,
 ) {
@@ -637,6 +743,18 @@ fn draw_hud(
     };
     text_aligned(px, font, &label, 14.0, l, b - 16.0, c, Align::Left);
     text_aligned(px, font, "ADS-B", 12.0, l, b, p.glow[5], Align::Left);
+    if status == Status::Live && icelandair > 0 {
+        text_aligned(
+            px,
+            font,
+            &format!("ICE {icelandair:02}"),
+            14.0,
+            l,
+            b - 32.0,
+            GOLD,
+            Align::Left,
+        );
+    }
     text_aligned(
         px,
         font,
@@ -721,6 +839,23 @@ fn circle(px: &mut Pixmap, r: f32, width: f32, c: Rgb) {
     px.stroke_path(&path, &paint(c, 255), &stroke, Transform::identity(), None);
 }
 
+fn ring(px: &mut Pixmap, (x, y): (f32, f32), r: f32, width: f32, c: Rgb, alpha: u8) {
+    let Some(path) = PathBuilder::from_circle(x, y, r) else {
+        return;
+    };
+    let stroke = Stroke {
+        width,
+        ..Stroke::default()
+    };
+    px.stroke_path(
+        &path,
+        &paint(c, alpha),
+        &stroke,
+        Transform::identity(),
+        None,
+    );
+}
+
 fn dot(px: &mut Pixmap, (x, y): (f32, f32), r: f32, c: Rgb, alpha: u8) {
     if let Some(path) = PathBuilder::from_circle(x, y, r) {
         px.fill_path(
@@ -757,6 +892,15 @@ mod tests {
         assert!((lat - 64.0).abs() < 1e-4);
         let east_nm = (lon + 22.0) * 60.0 * 64f32.to_radians().cos();
         assert!((east_nm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn spots_icelandair() {
+        assert!(is_icelandair("ICE614"));
+        assert!(is_icelandair("ICE5TP"));
+        assert!(!is_icelandair("ICELAND"));
+        assert!(!is_icelandair("PLAY101"));
+        assert!(!is_icelandair("TF-ISB"));
     }
 
     #[test]
