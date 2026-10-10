@@ -14,8 +14,14 @@ use serde_json::Value;
 
 /// adsb.lol rate-limits by load without saying how much is allowed;
 /// positions are dead reckoned between polls, so a slow rate still moves
-/// smoothly.
+/// smoothly. This is the fastest we poll; the actual pace adapts.
 const POLL: Duration = Duration::from_secs(10);
+/// Each 429 slows the steady pace by this much, up to `MAX_PACE`...
+const PACE_STEP: Duration = Duration::from_secs(2);
+const MAX_PACE: Duration = Duration::from_secs(60);
+/// ...and each success speeds it up by this much, so it settles just under
+/// the limit instead of bouncing off it every minute.
+const PACE_RELAX: Duration = Duration::from_millis(100);
 /// First wait after HTTP 429, doubling while it persists.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
@@ -56,6 +62,8 @@ pub struct State {
     pub aircraft: Vec<Aircraft>,
     pub seq: u64,
     pub error: Option<String>,
+    /// When the last fetch succeeded.
+    pub fetched_at: Option<Instant>,
     /// Last time the radar was drawn; fetching pauses when this gets old.
     wanted_at: Option<Instant>,
 }
@@ -83,6 +91,9 @@ fn run(shared: &Shared, url: &str) {
         .user_agent(concat!("cooler-lcd/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
+    // `pace` is the steady interval between successful polls; `backoff`
+    // the wait while errors persist.
+    let mut pace = POLL;
     let mut backoff = POLL;
     loop {
         let wanted = shared
@@ -102,14 +113,19 @@ fn run(shared: &Shared, url: &str) {
                 }
                 s.aircraft = aircraft;
                 s.seq += 1;
-                backoff = POLL;
-                POLL
+                s.fetched_at = Some(Instant::now());
+                pace = relax(pace);
+                backoff = pace;
+                pace
             }
             Err(e) => {
                 backoff = match e {
-                    FetchError::RateLimited(retry_after) => (backoff * 2)
-                        .max(RATE_LIMIT_BACKOFF)
-                        .max(retry_after.unwrap_or_default()),
+                    FetchError::RateLimited(retry_after) => {
+                        pace = slow_down(pace);
+                        (backoff * 2)
+                            .max(RATE_LIMIT_BACKOFF)
+                            .max(retry_after.unwrap_or_default())
+                    }
                     FetchError::Other(_) => backoff * 2,
                 }
                 .min(MAX_BACKOFF);
@@ -119,7 +135,11 @@ fn run(shared: &Shared, url: &str) {
                 };
                 let mut s = shared.lock().unwrap();
                 if s.error.as_ref() != Some(&msg) {
-                    eprintln!("radar: {msg}; retrying in {}s", backoff.as_secs());
+                    eprintln!(
+                        "radar: {msg}; retrying in {}s, then polling every {:.1}s",
+                        backoff.as_secs(),
+                        pace.as_secs_f32()
+                    );
                 }
                 s.error = Some(msg);
                 backoff
@@ -127,6 +147,14 @@ fn run(shared: &Shared, url: &str) {
         };
         thread::sleep(wait);
     }
+}
+
+fn slow_down(pace: Duration) -> Duration {
+    (pace + PACE_STEP).min(MAX_PACE)
+}
+
+fn relax(pace: Duration) -> Duration {
+    pace.saturating_sub(PACE_RELAX).max(POLL)
 }
 
 enum FetchError {
@@ -232,6 +260,20 @@ fn parse(body: &str, now: Instant) -> Result<Vec<Aircraft>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pace_settles_between_limits() {
+        assert_eq!(relax(POLL), POLL);
+        assert_eq!(slow_down(POLL), POLL + PACE_STEP);
+        assert_eq!(slow_down(MAX_PACE), MAX_PACE);
+        // One 429 costs 20 successful polls before the pace is back to it.
+        let mut pace = slow_down(POLL);
+        for _ in 0..19 {
+            pace = relax(pace);
+        }
+        assert!(pace > POLL);
+        assert_eq!(relax(pace), POLL);
+    }
 
     #[test]
     fn parses_adsb_lol() {

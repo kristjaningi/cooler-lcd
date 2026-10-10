@@ -161,8 +161,12 @@ impl Screen for Radar {
         let fresh = {
             let mut feed = self.feed.lock().unwrap();
             feed.want();
+            // A failed poll (usually a 429) leaves the last aircraft list in
+            // place and dead reckoning carries on, so the link only counts
+            // as lost once that data has gone stale.
+            let recent = feed.fetched_at.is_some_and(|t| t.elapsed() < adsb::MAX_AGE);
             self.status = match (&feed.error, feed.seq) {
-                (Some(_), _) => Status::NoLink,
+                (Some(_), _) if !recent => Status::NoLink,
                 (None, 0) => Status::Acquiring,
                 _ => Status::Live,
             };
