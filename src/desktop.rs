@@ -8,11 +8,11 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -77,9 +77,19 @@ fn monitors() -> Result<Vec<Monitor>> {
 
 /// Sends one request to Hyprland's command socket and returns the reply.
 fn ask(request: &[u8]) -> Result<String> {
-    let path = socket().context("no Hyprland socket")?;
+    let mut last_err = None;
+    for path in sockets() {
+        match ask_at(&path, request) {
+            Ok(reply) => return Ok(reply),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no Hyprland socket")))
+}
+
+fn ask_at(path: &Path, request: &[u8]) -> Result<String> {
     let mut stream =
-        UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
+        UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     stream.write_all(request)?;
@@ -88,22 +98,32 @@ fn ask(request: &[u8]) -> Result<String> {
     Ok(reply)
 }
 
-/// The running instance's socket: the one `HYPRLAND_INSTANCE_SIGNATURE`
-/// names, else the newest, since Hyprland may have restarted since the
-/// service started.
-fn socket() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("hypr");
+/// Hyprland command sockets to try, best first: the instance
+/// `HYPRLAND_INSTANCE_SIGNATURE` names, then the rest newest first. Hyprland
+/// may have restarted since the service started, and after a crash the old
+/// instance's socket file stays behind with nothing listening, so a socket
+/// that refuses the connection falls through to the next.
+fn sockets() -> Vec<PathBuf> {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Vec::new();
+    };
+    let dir = PathBuf::from(runtime).join("hypr");
     let named = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")
-        .map(|sig| dir.join(sig).join(".socket.sock"))
-        .filter(|p| p.exists());
-    named.or_else(|| {
-        std::fs::read_dir(&dir)
-            .ok()?
-            .flatten()
-            .map(|e| e.path().join(".socket.sock"))
-            .filter(|p| p.exists())
-            .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
-    })
+        .map(|sig| dir.join(sig).join(".socket.sock"));
+    let mut others: Vec<(Option<SystemTime>, PathBuf)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join(".socket.sock"))
+        .filter(|p| p.exists() && Some(p) != named.as_ref())
+        .map(|p| (p.metadata().and_then(|m| m.modified()).ok(), p))
+        .collect();
+    others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    named
+        .filter(|p| p.exists())
+        .into_iter()
+        .chain(others.into_iter().map(|(_, p)| p))
+        .collect()
 }
 
 #[cfg(test)]
