@@ -24,6 +24,20 @@ pub struct Radar {
     /// Compass bearing at the top of the scope, so the map can face the
     /// way the panel does. 0 is north up.
     pub heading: f32,
+    /// Latitude and longitude at the middle of the scope; between Keflavik
+    /// and Reykjavik when unset.
+    #[serde(deserialize_with = "center")]
+    pub center: Option<[f32; 2]>,
+}
+
+fn center<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[f32; 2]>, D::Error> {
+    let [lat, lon] = <[f32; 2]>::deserialize(d)?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(serde::de::Error::custom(
+            "radar center is [latitude, longitude], within ±90 and ±180",
+        ));
+    }
+    Ok(Some([lat, lon]))
 }
 
 impl Default for Config {
@@ -80,6 +94,10 @@ mod tests {
         assert_eq!(c.rotate(), Duration::from_secs(30));
         let c = Config::parse("[radar]\nheading = 111").unwrap();
         assert_eq!(c.radar.heading, 111.0);
+        assert_eq!(c.radar.center, None);
+        let c = Config::parse("[radar]\ncenter = [64.0, -22.0]").unwrap();
+        assert_eq!(c.radar.center, Some([64.0, -22.0]));
+        assert!(Config::parse("[radar]\ncenter = [-22.0, 640.0]").is_err());
     }
 
     #[test]

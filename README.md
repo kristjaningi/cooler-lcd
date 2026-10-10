@@ -129,10 +129,13 @@ rotate_seconds = 15       # time per screen when more than one is listed
 
 [radar]
 heading = 0               # compass bearing at the top of the scope (0 = north up)
+center = [64.05, -22.25]  # [latitude, longitude] at the middle of the scope
 ```
 
 For `heading`, use the direction you face when you look at the panel. The
-bezel's labels stay true compass bearings and an N marks north.
+bezel's labels stay true compass bearings and an N marks north. `center`
+can be your home: the config file stays on your machine, and adsb.fi is
+only asked about a spot rounded to 0.1 degrees.
 
 Restart the service after editing it. A broken config is logged and the
 defaults are used.

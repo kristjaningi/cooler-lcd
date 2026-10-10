@@ -67,7 +67,13 @@ pub fn build(name: &str, config: &Config) -> Option<Box<dyn Screen>> {
     match name {
         "dashboard" => Some(Box::new(dashboard::Dashboard::new())),
         "usage" => Some(Box::new(usage::Usage::new())),
-        "radar" => Some(Box::new(radar::Radar::new(config.radar.heading))),
+        "radar" => Some(Box::new(radar::Radar::new(
+            config
+                .radar
+                .center
+                .map_or(radar::CENTER, |[lat, lon]| (lat, lon)),
+            config.radar.heading,
+        ))),
         _ => None,
     }
 }

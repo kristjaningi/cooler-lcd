@@ -11,3 +11,8 @@ rotate_seconds = 15
 # Compass bearing at the top of the scope: the direction you face looking
 # at the panel, so traffic on the screen's right is off to your right.
 heading = 0
+
+# Latitude and longitude at the middle of the scope; between Keflavik and
+# Reykjavik when unset. Stays on this machine: the feed is only asked
+# about a spot rounded to 0.1 degrees.
+# center = [64.05, -22.25]

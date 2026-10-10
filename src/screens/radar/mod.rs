@@ -28,12 +28,17 @@ use crate::draw::{Align, mix, text_aligned};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
 
-/// Scope center, between the two airports.
-const CENTER: (f32, f32) = (64.05, -22.25);
+/// Scope center unless the config sets one: between the two airports.
+pub const CENTER: (f32, f32) = (64.05, -22.25);
 /// Range at the scope's edge, nautical miles.
 const RANGE_NM: f32 = 25.0;
-/// Aircraft are fetched a little beyond the edge so they enter smoothly.
+/// Aircraft are fetched a little beyond the edge so they enter smoothly,
+/// and so the fetch can ask about a coarser center than the scope's.
 const FETCH_NM: u32 = 35;
+/// The center sent to the feed is rounded to this many degrees (about
+/// 3 nm north-south at most off, well inside the extra fetched range), so
+/// a precise center, like someone's home, stays on this machine.
+const FETCH_GRID: f32 = 0.1;
 const RING_NM: f32 = 5.0;
 const C: f32 = SIZE as f32 / 2.0;
 const SCOPE_R: f32 = 222.0;
@@ -99,16 +104,17 @@ enum Status {
 }
 
 impl Radar {
-    /// `heading` is the compass bearing at the top of the scope.
-    pub fn new(heading: f32) -> Self {
+    /// `center` is the latitude and longitude at the middle of the scope,
+    /// `heading` the compass bearing at its top.
+    pub fn new(center: (f32, f32), heading: f32) -> Self {
         let mut scope = Mask::new(SIZE, SIZE).unwrap();
         if let Some(circle) = PathBuilder::from_circle(C, C, SCOPE_R) {
             scope.fill_path(&circle, FillRule::Winding, true, Transform::identity());
         }
         let now = Instant::now();
         Self {
-            view: View::new(heading),
-            feed: adsb::spawn(CENTER.0, CENTER.1, FETCH_NM),
+            view: View::new(center, heading),
+            feed: adsb::spawn(coarse(center.0), coarse(center.1), FETCH_NM),
             seq: 0,
             tracks: HashMap::new(),
             started: now,
@@ -339,25 +345,38 @@ impl<'a> Palette<'a> {
     }
 }
 
-/// How the map lies on the scope: which compass bearing is at the top.
+/// Rounds a coordinate to the `FETCH_GRID`.
+fn coarse(deg: f32) -> f32 {
+    (deg / FETCH_GRID).round() * FETCH_GRID
+}
+
+/// How the map lies on the scope: where its center is and which compass
+/// bearing is at the top.
 pub struct View {
+    center: (f32, f32),
     up: f32,
     sin: f32,
     cos: f32,
 }
 
 impl View {
-    pub fn new(up: f32) -> Self {
+    pub fn new(center: (f32, f32), up: f32) -> Self {
         let up = up.rem_euclid(360.0);
         let (sin, cos) = up.to_radians().sin_cos();
-        Self { up, sin, cos }
+        Self {
+            center,
+            up,
+            sin,
+            cos,
+        }
     }
 
     /// Screen position of a latitude/longitude (local flat-earth
     /// projection, turned so `up` points to the top).
     pub fn project(&self, (lat, lon): (f32, f32)) -> (f32, f32) {
-        let north = (lat - CENTER.0) * 60.0;
-        let east = (lon - CENTER.1) * 60.0 * CENTER.0.to_radians().cos();
+        let (clat, clon) = self.center;
+        let north = (lat - clat) * 60.0;
+        let east = (lon - clon) * 60.0 * clat.to_radians().cos();
         let right = east * self.cos - north * self.sin;
         let ahead = east * self.sin + north * self.cos;
         (C + right * PX_PER_NM, C - ahead * PX_PER_NM)
@@ -1037,7 +1056,7 @@ mod tests {
 
     #[test]
     fn projects_around_center() {
-        let view = View::new(0.0);
+        let view = View::new(CENTER, 0.0);
         let (x, y) = view.project(CENTER);
         assert!((x - C).abs() < 0.01 && (y - C).abs() < 0.01);
         // 10 nm north is 10 nm worth of pixels up.
@@ -1051,7 +1070,7 @@ mod tests {
 
     #[test]
     fn turns_the_map() {
-        let view = View::new(111.0);
+        let view = View::new(CENTER, 111.0);
         let near = |(x, y): (f32, f32), (ex, ey): (f32, f32)| {
             assert!((x - ex).abs() < 0.05 && (y - ey).abs() < 0.05, "{x},{y}");
         };
@@ -1066,7 +1085,7 @@ mod tests {
             (C + ten_nm, C),
         );
         assert_eq!(view.turn(111.0), 0.0);
-        assert_eq!(View::new(-90.0).up, 270.0);
+        assert_eq!(View::new(CENTER, -90.0).up, 270.0);
     }
 
     #[test]
@@ -1081,7 +1100,7 @@ mod tests {
     #[test]
     fn spots_arrivals_and_departures() {
         for heading in [0.0, 111.0] {
-            spots_movements(&View::new(heading));
+            spots_movements(&View::new(CENTER, heading));
         }
     }
 
@@ -1133,6 +1152,16 @@ mod tests {
         let m = at(&departure).unwrap();
         assert_eq!(m.kind, runways::Kind::Departure);
         assert_eq!((m.airport, m.runway), ("BIKF", "01"));
+    }
+
+    #[test]
+    fn fetches_around_a_coarser_center() {
+        assert!((coarse(64.04) - 64.0).abs() < 1e-4);
+        assert!((coarse(-21.93) + 21.9).abs() < 1e-4);
+        // The most the fetch center can be off, plus the scope's reach,
+        // stays inside what's fetched.
+        let off_nm = FETCH_GRID / 2.0 * 60.0;
+        assert!(RANGE_NM + off_nm < FETCH_NM as f32);
     }
 
     #[test]
