@@ -22,6 +22,8 @@ use crate::theme::{Rgb, Theme};
 /// Records older than this are drawn dimmed with their age: three missed
 /// refreshes at Omarchy's default interval.
 const STALE: Duration = Duration::from_secs(45 * 60);
+/// A limit at least this used takes over the panel.
+const ALERT_USED: f32 = 0.9;
 
 /// Agents listed first, in this order, and shown even without limits (to
 /// say why). Any other agent appears after them once it reports a limit.
@@ -177,6 +179,20 @@ impl Screen for Usage {
         let changed = self.content != content;
         self.content = content;
         changed
+    }
+
+    fn alert(&mut self, now: DateTime<Local>) -> Option<String> {
+        self.reload();
+        let now = now.with_timezone(&Utc);
+        self.agents.iter().find_map(|a| {
+            let limit = a.limits.iter().find(|l| nearly_spent(l, now))?;
+            Some(format!(
+                "{} {} over {:.0}%",
+                a.name,
+                short_label(&limit.label),
+                ALERT_USED * 100.0
+            ))
+        })
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {
@@ -351,6 +367,11 @@ fn row(limit: &Limit, now: DateTime<Utc>) -> Row {
         },
         vs_pace: elapsed.map(|e| percent as i32 - (e * 100.0).round() as i32),
     }
+}
+
+/// At least `ALERT_USED` spent, and not already past its reset.
+fn nearly_spent(limit: &Limit, now: DateTime<Utc>) -> bool {
+    limit.used >= ALERT_USED && limit.resets_at.is_none_or(|t| t > now)
 }
 
 fn section_height(s: &Section) -> f32 {
@@ -611,5 +632,29 @@ mod tests {
         };
         let r = row(&passed, now);
         assert_eq!((r.percent, r.caption.as_str(), r.pace), (0, "Reset", None));
+    }
+
+    #[test]
+    fn alerts_on_nearly_spent_limits() {
+        let now = Utc::now();
+        let limit = Limit {
+            label: "Session".into(),
+            used: 0.92,
+            resets_at: Some(now + chrono::Duration::minutes(30)),
+            window: None,
+        };
+        assert!(nearly_spent(&limit, now));
+        let reset = Limit {
+            resets_at: Some(now - chrono::Duration::minutes(1)),
+            ..limit.clone()
+        };
+        assert!(!nearly_spent(&reset, now), "already started over");
+        assert!(!nearly_spent(
+            &Limit {
+                used: 0.89,
+                ..limit
+            },
+            now
+        ));
     }
 }

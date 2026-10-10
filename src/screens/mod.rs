@@ -32,6 +32,15 @@ pub trait Screen {
         Duration::from_secs(1)
     }
 
+    /// Something worth taking over the panel for, checked about once a
+    /// second whether or not the screen is visible, so keep it cheap. The
+    /// carousel jumps here when this turns `Some` or names something new,
+    /// and holds for one rotation; a condition that persists doesn't pin
+    /// the screen. Keep the text stable while the condition lasts.
+    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
+        None
+    }
+
     /// True while the first data is still on its way, so `--preview` can
     /// wait for it instead of capturing an empty screen.
     fn loading(&self) -> bool {

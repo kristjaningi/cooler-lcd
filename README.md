@@ -28,6 +28,14 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   only when the screen reports a change, the theme changes, or the next screen
   rotates in (`src/render.rs`). Still screens run at one frame a second;
   animated ones set their own `interval()`.
+- **Takeovers:** every screen is asked about once a second whether something
+  needs attention, even while it's hidden. When one starts, its screen jumps
+  the queue and stays up for a full rotation: the dashboard when the CPU or
+  GPU reaches 85° (it must cool below 75° to trigger again), usage when a
+  plan limit passes 90%, and the radar on an emergency squawk or an
+  Icelandair flight landing. A condition that lasts doesn't pin its screen;
+  only a new one takes over again. The radar only sees traffic while it has
+  been on screen recently, since it doesn't fetch just to check.
 - **Sensors:** CPU from hwmon (`k10temp` Tdie/Tctl, `coretemp`), GPU from
   NVML, polled every 3 s. Missing sensors are retried every 30 s
   (`src/screens/sensors.rs`).
@@ -81,6 +89,7 @@ defaults are used.
 Implement the `Screen` trait in a new module under `src/screens/` and register
 it in `build()` and `NAMES` in `src/screens/mod.rs`. `update()` runs inside the
 frame loop, so fetch anything slow (network, big files) on a background thread.
+Implement `alert()` to take over the panel when something happens.
 
 ## Install
 

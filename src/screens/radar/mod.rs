@@ -53,6 +53,11 @@ const ICELANDAIR: &str = "ICE";
 /// Icelandair gold, fixed rather than themed so the flag carrier always
 /// stands out from the phosphor.
 const GOLD: Rgb = Rgb(255, 184, 28);
+/// An Icelandair flight descending through this, near an airport, is
+/// landing and takes over the panel.
+const LANDING_ALT: i32 = 3000;
+const LANDING_VRATE: i32 = -300;
+const LANDING_NM: f32 = 10.0;
 /// One beacon pulse around each Icelandair aircraft.
 const PULSE: Duration = Duration::from_millis(1800);
 
@@ -111,6 +116,31 @@ impl Radar {
         }
     }
 
+    /// Takes in a newer aircraft list from the feed, if there is one. `want` marks the radar as
+    /// on screen, which keeps the feed polling.
+    fn sync(&mut self, want: bool) {
+        let fresh = {
+            let mut feed = self.feed.lock().unwrap();
+            if want {
+                feed.want();
+            }
+            // A failed poll (usually a 429) leaves the last aircraft list in
+            // place and dead reckoning carries on, so the link only counts
+            // as lost once that data has gone stale.
+            let recent = feed.fetched_at.is_some_and(|t| t.elapsed() < adsb::MAX_AGE);
+            self.status = match (&feed.error, feed.seq) {
+                (Some(_), _) if !recent => Status::NoLink,
+                (None, 0) => Status::Acquiring,
+                _ => Status::Live,
+            };
+            (feed.seq != self.seq).then(|| (feed.seq, feed.aircraft.clone()))
+        };
+        if let Some((seq, aircraft)) = fresh {
+            self.seq = seq;
+            self.merge(aircraft);
+        }
+    }
+
     fn merge(&mut self, aircraft: Vec<adsb::Aircraft>) {
         let mut tracks = HashMap::with_capacity(aircraft.len());
         for ac in aircraft {
@@ -158,24 +188,7 @@ impl Screen for Radar {
     fn update(&mut self, now: DateTime<Local>) -> bool {
         self.now = Instant::now();
         self.utc = now.with_timezone(&Utc);
-        let fresh = {
-            let mut feed = self.feed.lock().unwrap();
-            feed.want();
-            // A failed poll (usually a 429) leaves the last aircraft list in
-            // place and dead reckoning carries on, so the link only counts
-            // as lost once that data has gone stale.
-            let recent = feed.fetched_at.is_some_and(|t| t.elapsed() < adsb::MAX_AGE);
-            self.status = match (&feed.error, feed.seq) {
-                (Some(_), _) if !recent => Status::NoLink,
-                (None, 0) => Status::Acquiring,
-                _ => Status::Live,
-            };
-            (feed.seq != self.seq).then(|| (feed.seq, feed.aircraft.clone()))
-        };
-        if let Some((seq, aircraft)) = fresh {
-            self.seq = seq;
-            self.merge(aircraft);
-        }
+        self.sync(true);
         // The sweep never stops, so every frame is new.
         true
     }
@@ -238,6 +251,28 @@ impl Screen for Radar {
         scanlines(px);
     }
 
+    /// An emergency squawk, else an Icelandair flight landing. Uses the data
+    /// already fetched without asking for more, so it only sees traffic
+    /// while the radar has been on screen recently.
+    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
+        self.sync(false);
+        let now = Instant::now();
+        let mut live: Vec<&adsb::Aircraft> = self
+            .tracks
+            .values()
+            .map(|t| &t.ac)
+            .filter(|ac| now.saturating_duration_since(ac.fixed_at) < adsb::MAX_AGE)
+            .filter(|ac| in_scope(project(dead_reckon(ac, now))))
+            .collect();
+        live.sort_by(|a, b| a.ident.cmp(&b.ident));
+        if let Some(ac) = live.iter().find(|ac| ac.emergency) {
+            return Some(format!("{} squawking emergency", ac.ident));
+        }
+        live.iter()
+            .find(|ac| is_icelandair(&ac.ident) && landing(ac, now))
+            .map(|ac| format!("{} landing", ac.ident))
+    }
+
     fn interval(&self) -> Duration {
         FRAME
     }
@@ -275,6 +310,18 @@ impl<'a> Palette<'a> {
     fn level(&self, level: f32) -> Rgb {
         mix(self.backdrop, self.phosphor, level.clamp(0.0, 1.0))
     }
+}
+
+/// Low, descending and close to one of the airports.
+fn landing(ac: &adsb::Aircraft, now: Instant) -> bool {
+    let low = ac.alt.is_some_and(|alt| alt < LANDING_ALT);
+    let descending = ac.vrate.is_some_and(|v| v <= LANDING_VRATE);
+    let (x, y) = project(dead_reckon(ac, now));
+    let near = AIRPORTS.iter().any(|(_, pos)| {
+        let (ax, ay) = project(*pos);
+        (x - ax).hypot(y - ay) / PX_PER_NM <= LANDING_NM
+    });
+    low && descending && near
 }
 
 /// Screen position of a latitude/longitude (local flat-earth projection).
@@ -896,6 +943,40 @@ mod tests {
         assert!((lat - 64.0).abs() < 1e-4);
         let east_nm = (lon + 22.0) * 60.0 * 64f32.to_radians().cos();
         assert!((east_nm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn spots_landings() {
+        let now = Instant::now();
+        let finals = adsb::Aircraft {
+            hex: "4cc2a1".into(),
+            ident: "ICE614".into(),
+            // About 4 nm out from Keflavik.
+            lat: 63.92,
+            lon: -22.6,
+            alt: Some(1400),
+            gs: None,
+            track: None,
+            vrate: Some(-700),
+            emergency: false,
+            fixed_at: now,
+        };
+        assert!(landing(&finals, now));
+        let climbing = adsb::Aircraft {
+            vrate: Some(1500),
+            ..finals.clone()
+        };
+        assert!(!landing(&climbing, now));
+        let cruising = adsb::Aircraft {
+            alt: Some(34000),
+            ..finals.clone()
+        };
+        assert!(!landing(&cruising, now));
+        let far = adsb::Aircraft {
+            lat: 64.4,
+            ..finals
+        };
+        assert!(!landing(&far, now));
     }
 
     #[test]

@@ -30,6 +30,8 @@ const RETRY: Duration = Duration::from_secs(3);
 /// Wall clock running this far ahead of the monotonic clock means we slept;
 /// the USB handle may be stale, so reconnect.
 const WAKE_GAP: Duration = Duration::from_secs(5);
+/// How often every screen is asked whether it wants to take over.
+const ALERT_CHECK: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -106,7 +108,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            dirty |= carousel.advance();
+            dirty |= carousel.advance(&mut log);
             let screen = carousel.current();
             dirty |= screen.update(Local::now());
 
@@ -131,9 +133,13 @@ fn main() -> Result<()> {
     }
 }
 
-/// The configured screens, shown one at a time for `rotate` each.
+/// The configured screens, shown one at a time for `rotate` each. A screen
+/// that raises a new alert jumps the queue and stays up for a full `rotate`.
 struct Carousel {
-    screens: Vec<Box<dyn Screen>>,
+    screens: Vec<(String, Box<dyn Screen>)>,
+    /// Each screen's alert as of the last check, to spot new ones.
+    alerts: Vec<Option<String>>,
+    checked_at: Option<Instant>,
     index: usize,
     shown_at: Instant,
     rotate: Duration,
@@ -144,7 +150,7 @@ impl Carousel {
         let mut screens = Vec::new();
         for name in names {
             match screens::build(name) {
-                Some(s) => screens.push(s),
+                Some(s) => screens.push((name.clone(), s)),
                 None => log.error(format!(
                     "unknown screen {name:?} (available: {})",
                     screens::NAMES.join(", ")
@@ -155,16 +161,28 @@ impl Carousel {
             bail!("no usable screens configured");
         }
         Ok(Self {
+            alerts: vec![None; screens.len()],
             screens,
+            checked_at: None,
             index: 0,
             shown_at: Instant::now(),
             rotate,
         })
     }
 
-    /// Moves to the next screen when its time is up. Returns true on a switch.
-    fn advance(&mut self) -> bool {
-        if self.screens.len() < 2 || self.shown_at.elapsed() < self.rotate {
+    /// Moves to a screen with a new alert, else to the next screen when the
+    /// current one's time is up. Returns true on a switch.
+    fn advance(&mut self, log: &mut Log) -> bool {
+        if self.screens.len() < 2 {
+            return false;
+        }
+        if let Some(i) = self.new_alert(log) {
+            self.shown_at = Instant::now();
+            let switched = i != self.index;
+            self.index = i;
+            return switched;
+        }
+        if self.shown_at.elapsed() < self.rotate {
             return false;
         }
         self.index = (self.index + 1) % self.screens.len();
@@ -172,8 +190,30 @@ impl Carousel {
         true
     }
 
+    /// Asks every screen for its alert, at most once per `ALERT_CHECK`, and
+    /// returns the first screen whose alert is new.
+    fn new_alert(&mut self, log: &mut Log) -> Option<usize> {
+        if self.checked_at.is_some_and(|t| t.elapsed() < ALERT_CHECK) {
+            return None;
+        }
+        self.checked_at = Some(Instant::now());
+        let now = Local::now();
+        let mut first = None;
+        for (i, (name, screen)) in self.screens.iter_mut().enumerate() {
+            let alert = screen.alert(now);
+            if let Some(msg) = &alert
+                && self.alerts[i].as_ref() != Some(msg)
+            {
+                log.info(format!("{name}: {msg}"));
+                first.get_or_insert(i);
+            }
+            self.alerts[i] = alert;
+        }
+        first
+    }
+
     fn current(&mut self) -> &mut Box<dyn Screen> {
-        &mut self.screens[self.index]
+        &mut self.screens[self.index].1
     }
 }
 

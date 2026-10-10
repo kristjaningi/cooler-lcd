@@ -13,6 +13,10 @@ const CARD_Y: f32 = 284.0;
 const CARD_W: f32 = 208.0;
 const CARD_H: f32 = 172.0;
 const CARD_XS: [f32; 2] = [24.0, 248.0];
+/// A temperature at or above `HOT` takes over the panel; it has to drop
+/// below `COOL` before it can again, so hovering at the line doesn't flap.
+const HOT: f32 = 85.0;
+const COOL: f32 = 75.0;
 
 /// Everything visible; the screen is redrawn only when this changes.
 #[derive(PartialEq)]
@@ -25,6 +29,8 @@ struct Content {
 pub struct Dashboard {
     sensors: Sensors,
     content: Option<Content>,
+    /// CPU and GPU currently over `HOT` (until they drop below `COOL`).
+    hot: [bool; 2],
 }
 
 impl Dashboard {
@@ -32,6 +38,7 @@ impl Dashboard {
         Self {
             sensors: Sensors::new(),
             content: None,
+            hot: [false; 2],
         }
     }
 }
@@ -47,6 +54,18 @@ impl Screen for Dashboard {
         let changed = self.content.as_ref() != Some(&content);
         self.content = Some(content);
         changed
+    }
+
+    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
+        let (cpu, gpu) = self.sensors.temps();
+        for (hot, temp) in self.hot.iter_mut().zip([cpu, gpu]) {
+            *hot = hot_now(*hot, temp);
+        }
+        ["CPU", "GPU"]
+            .into_iter()
+            .zip(self.hot)
+            .find(|(_, hot)| *hot)
+            .map(|(label, _)| format!("{label} over {HOT:.0}°"))
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {
@@ -91,5 +110,29 @@ fn temp_color(theme: &Theme, t: i32) -> Rgb {
         80.. => theme.red,
         65.. => theme.yellow,
         _ => theme.green,
+    }
+}
+
+/// Whether a sensor counts as hot, given whether it did a moment ago. A
+/// missing reading clears it.
+fn hot_now(was_hot: bool, temp: Option<f32>) -> bool {
+    match temp {
+        Some(t) if t >= HOT => true,
+        Some(t) if was_hot => t >= COOL,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_has_hysteresis() {
+        assert!(!hot_now(false, Some(84.0)));
+        assert!(hot_now(false, Some(85.0)));
+        assert!(hot_now(true, Some(80.0)), "stays hot until it cools");
+        assert!(!hot_now(true, Some(74.0)));
+        assert!(!hot_now(true, None));
     }
 }
