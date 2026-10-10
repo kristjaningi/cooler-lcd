@@ -88,7 +88,8 @@ with `trcc kill`) first.
 ## Control
 
 The running service takes commands over a socket at
-`$XDG_RUNTIME_DIR/cooler-lcd.sock` (`src/control.rs`):
+`$XDG_RUNTIME_DIR/cooler-lcd.sock`, readable only by you; without
+`XDG_RUNTIME_DIR` there's no socket (`src/control.rs`):
 
 ```sh
 cooler-lcd next                        # show the next screen

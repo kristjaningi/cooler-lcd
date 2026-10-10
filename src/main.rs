@@ -99,7 +99,16 @@ fn main() -> Result<()> {
     loop {
         let tick = Instant::now();
 
-        for Request { command, reply } in requests.iter().flat_map(|r| r.try_iter()) {
+        for Request {
+            command,
+            reply,
+            expires,
+        } in requests.iter().flat_map(|r| r.try_iter())
+        {
+            // The client already gave up waiting and was told so.
+            if Instant::now() >= expires {
+                continue;
+            }
             let outcome = match command {
                 Command::Next | Command::Show(_) if desktop.away() => {
                     Err("the desktop is away, so the panel shows the clock".into())
