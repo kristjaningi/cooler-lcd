@@ -6,6 +6,7 @@
 //! a background thread, because `update` runs inside the frame loop: the
 //! sender keeps resending the last frame, but the picture freezes meanwhile.
 
+mod away;
 mod dashboard;
 mod radar;
 mod sensors;
@@ -58,4 +59,10 @@ pub fn build(name: &str) -> Option<Box<dyn Screen>> {
         "radar" => Some(Box::new(radar::Radar::new())),
         _ => None,
     }
+}
+
+/// The dim clock shown instead of the carousel while nobody is at the
+/// desktop.
+pub fn away() -> Box<dyn Screen> {
+    Box::new(away::Away::new())
 }

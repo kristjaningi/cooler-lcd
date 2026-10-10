@@ -58,8 +58,14 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   between polls, so blips glide at the 15 fps animation rate. The static
   scope, rings and map are drawn once per theme. Coastline from Natural
   Earth, runways from OurAirports (`src/screens/radar/`).
-- **Recovery:** reconnects when the cooler is unplugged or a write fails, and
-  after suspend (detected as the wall clock jumping ahead of the monotonic
+- **Away:** while the Hyprland session is locked or every monitor is off,
+  a dim clock replaces the screens, which stop updating, so the radar stops
+  fetching and plan usage isn't on display. Checked every 2 s over
+  Hyprland's IPC socket (`src/desktop.rs`).
+- **Recovery:** a sender thread owns the panel and resends the latest frame
+  every second whatever the frame loop is doing (`src/sender.rs`). It
+  reconnects when the cooler is unplugged or a write fails, and after
+  suspend (detected as the wall clock jumping ahead of the monotonic
   clock).
 
 ## Run

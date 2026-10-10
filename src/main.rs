@@ -8,6 +8,7 @@
 //! `--screen` shows just that screen instead of the config's list.
 
 mod config;
+mod desktop;
 mod device;
 mod draw;
 mod log;
@@ -23,6 +24,7 @@ use anyhow::{Result, bail};
 use chrono::Local;
 
 use config::Config;
+use desktop::Desktop;
 use device::HEADER_LEN;
 use log::Log;
 use render::Renderer;
@@ -72,6 +74,9 @@ fn main() -> Result<()> {
     }
 
     let sender = Sender::spawn();
+    let desktop = Desktop::spawn();
+    let mut away_screen = screens::away();
+    let mut was_away = false;
     let mut theme_mtime = theme::colors_mtime();
     let mut dirty = true;
     loop {
@@ -98,8 +103,27 @@ fn main() -> Result<()> {
             }
         }
 
-        dirty |= carousel.advance(&mut log);
-        let screen = carousel.current();
+        // While the desktop is locked or dark, a dim clock stands in for the
+        // carousel, whose screens then stop updating (and fetching).
+        let away = desktop.away();
+        if away != was_away {
+            log.info(
+                if away {
+                    "desktop away; dimming"
+                } else {
+                    "desktop back"
+                }
+                .into(),
+            );
+            was_away = away;
+            dirty = true;
+        }
+        let screen = if away {
+            &mut away_screen
+        } else {
+            dirty |= carousel.advance(&mut log);
+            carousel.current()
+        };
         dirty |= screen.update(Local::now());
 
         // On a render error the sender keeps showing the previous frame;
