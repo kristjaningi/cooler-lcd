@@ -3,7 +3,7 @@
 //! centerline. Worked out in screen space, which the projection keeps
 //! true to shape this close to the center.
 
-use super::{PX_PER_NM, adsb, geo, project};
+use super::{PX_PER_NM, View, adsb, geo};
 
 /// Approaches and climb-outs are followed below this, feet.
 const MAX_ALT: i32 = 4000;
@@ -42,10 +42,10 @@ pub struct Direction {
 }
 
 /// Both directions of every runway, in screen space.
-pub fn directions() -> impl Iterator<Item = Direction> {
+pub fn directions(view: &View) -> impl Iterator<Item = Direction> {
     geo::RUNWAYS.iter().flat_map(|rw| {
         let [(ident_a, a), (ident_b, b)] = rw.ends;
-        let (a, b) = (project(a), project(b));
+        let (a, b) = (view.project(a), view.project(b));
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = dx.hypot(dy);
         let dir = (dx / len, dy / len);
@@ -70,16 +70,16 @@ pub fn directions() -> impl Iterator<Item = Direction> {
 }
 
 /// The approach or climb-out `ac` is on, given its screen position.
-pub fn classify(ac: &adsb::Aircraft, (x, y): (f32, f32)) -> Option<Movement> {
+pub fn classify(ac: &adsb::Aircraft, (x, y): (f32, f32), view: &View) -> Option<Movement> {
     let alt = ac.alt?;
-    let track = ac.track?.to_radians();
+    let track = view.turn(ac.track?).to_radians();
     if alt >= MAX_ALT {
         return None;
     }
     let climbing = ac.vrate.unwrap_or(0) >= CLIMBING;
     let heading = (track.sin(), -track.cos());
     let min_alignment = ALIGNED_DEG.to_radians().cos();
-    directions().find_map(|d| {
+    directions(view).find_map(|d| {
         if d.dir.0 * heading.0 + d.dir.1 * heading.1 < min_alignment {
             return None;
         }

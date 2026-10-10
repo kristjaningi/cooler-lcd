@@ -6,3 +6,8 @@ screens = ["dashboard"]
 
 # Seconds each screen stays up when more than one is listed.
 rotate_seconds = 15
+
+[radar]
+# Compass bearing at the top of the scope: the direction you face looking
+# at the panel, so traffic on the screen's right is off to your right.
+heading = 0

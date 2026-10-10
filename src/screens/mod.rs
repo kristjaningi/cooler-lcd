@@ -18,6 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
 
+use crate::config::Config;
 use crate::theme::Theme;
 
 pub trait Screen {
@@ -62,11 +63,11 @@ pub trait Screen {
 /// Names accepted in the config's `screens` list.
 pub const NAMES: &[&str] = &["dashboard", "usage", "radar"];
 
-pub fn build(name: &str) -> Option<Box<dyn Screen>> {
+pub fn build(name: &str, config: &Config) -> Option<Box<dyn Screen>> {
     match name {
         "dashboard" => Some(Box::new(dashboard::Dashboard::new())),
         "usage" => Some(Box::new(usage::Usage::new())),
-        "radar" => Some(Box::new(radar::Radar::new())),
+        "radar" => Some(Box::new(radar::Radar::new(config.radar.heading))),
         _ => None,
     }
 }

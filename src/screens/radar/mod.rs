@@ -5,6 +5,9 @@
 //!
 //! Positions come from ADS-B (see `adsb`) every few seconds and are dead
 //! reckoned in between, so blips move smoothly at the animation rate.
+//!
+//! The map can be turned so a chosen bearing is at the top (`View`), to
+//! face the way the panel does; the bezel's N marks north.
 
 mod adsb;
 mod geo;
@@ -68,6 +71,7 @@ struct Track {
 }
 
 pub struct Radar {
+    view: View,
     feed: adsb::Shared,
     seq: u64,
     tracks: HashMap<String, Track>,
@@ -95,13 +99,15 @@ enum Status {
 }
 
 impl Radar {
-    pub fn new() -> Self {
+    /// `heading` is the compass bearing at the top of the scope.
+    pub fn new(heading: f32) -> Self {
         let mut scope = Mask::new(SIZE, SIZE).unwrap();
         if let Some(circle) = PathBuilder::from_circle(C, C, SCOPE_R) {
             scope.fill_path(&circle, FillRule::Winding, true, Transform::identity());
         }
         let now = Instant::now();
         Self {
+            view: View::new(heading),
             feed: adsb::spawn(CENTER.0, CENTER.1, FETCH_NM),
             seq: 0,
             tracks: HashMap::new(),
@@ -157,7 +163,7 @@ impl Radar {
         self.tracks = tracks;
     }
 
-    /// The sweep's bearing now, degrees clockwise from north.
+    /// The sweep's angle now, degrees clockwise from the top.
     fn beam(&self) -> f32 {
         // Wrap in integer time first: uptime as an f32 loses the precision
         // a smooth sweep needs after a few days.
@@ -201,8 +207,8 @@ impl Screen for Radar {
         if cache.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut layer = Pixmap::new(SIZE, SIZE).unwrap();
             layer.fill(color(p.backdrop, 255));
-            draw_scope(&mut layer, &p);
-            draw_map(&mut layer, &p, &self.scope);
+            draw_scope(&mut layer, &p, &self.view);
+            draw_map(&mut layer, &p, &self.view, &self.scope);
             *cache = Some((key, layer));
         }
         if let Some((_, layer)) = cache.as_ref() {
@@ -216,7 +222,7 @@ impl Screen for Radar {
             .values()
             .filter(|t| self.now.saturating_duration_since(t.ac.fixed_at) < adsb::MAX_AGE)
             .map(|t| (t, dead_reckon(&t.ac, self.now)))
-            .filter(|(_, pos)| in_scope(project(*pos)))
+            .filter(|(_, pos)| in_scope(self.view.project(*pos)))
             .collect();
         // Ground traffic first, so airborne blips and their labels sit on
         // top, with Icelandair above the rest and emergencies above all.
@@ -229,7 +235,7 @@ impl Screen for Radar {
         });
         let pulse = self.pulse();
         for (track, pos) in &targets {
-            draw_track(px, &p, &self.scope, track, *pos, beam, pulse);
+            draw_track(px, &p, &self.view, &self.scope, track, *pos, beam, pulse);
         }
 
         let airborne = targets.iter().filter(|(t, _)| t.ac.alt.is_some()).count();
@@ -239,7 +245,10 @@ impl Screen for Radar {
             .count();
         let mut movements: Vec<(runways::Movement, &str)> = targets
             .iter()
-            .filter_map(|(t, pos)| Some((runways::classify(&t.ac, project(*pos))?, &*t.ac.ident)))
+            .filter_map(|(t, pos)| {
+                let m = runways::classify(&t.ac, self.view.project(*pos), &self.view)?;
+                Some((m, &*t.ac.ident))
+            })
             .collect();
         movements.sort_by_key(|(m, ident)| (m.kind == runways::Kind::Departure, *ident));
         movements.truncate(MOVEMENTS);
@@ -268,14 +277,14 @@ impl Screen for Radar {
             .map(|t| &t.ac)
             .filter(|ac| now.saturating_duration_since(ac.fixed_at) < adsb::MAX_AGE)
             .filter_map(|ac| {
-                let pos = project(dead_reckon(ac, now));
+                let pos = self.view.project(dead_reckon(ac, now));
                 if !in_scope(pos) {
                     return None;
                 }
                 if ac.emergency {
                     return Some(format!("{} squawking emergency", ac.ident));
                 }
-                let m = runways::classify(ac, pos)?;
+                let m = runways::classify(ac, pos, &self.view)?;
                 (is_icelandair(&ac.ident) && m.kind == runways::Kind::Arrival)
                     .then(|| format!("{} landing {} {}", ac.ident, m.airport, m.runway))
             })
@@ -330,11 +339,34 @@ impl<'a> Palette<'a> {
     }
 }
 
-/// Screen position of a latitude/longitude (local flat-earth projection).
-fn project((lat, lon): (f32, f32)) -> (f32, f32) {
-    let north = (lat - CENTER.0) * 60.0;
-    let east = (lon - CENTER.1) * 60.0 * CENTER.0.to_radians().cos();
-    (C + east * PX_PER_NM, C - north * PX_PER_NM)
+/// How the map lies on the scope: which compass bearing is at the top.
+pub struct View {
+    up: f32,
+    sin: f32,
+    cos: f32,
+}
+
+impl View {
+    pub fn new(up: f32) -> Self {
+        let up = up.rem_euclid(360.0);
+        let (sin, cos) = up.to_radians().sin_cos();
+        Self { up, sin, cos }
+    }
+
+    /// Screen position of a latitude/longitude (local flat-earth
+    /// projection, turned so `up` points to the top).
+    pub fn project(&self, (lat, lon): (f32, f32)) -> (f32, f32) {
+        let north = (lat - CENTER.0) * 60.0;
+        let east = (lon - CENTER.1) * 60.0 * CENTER.0.to_radians().cos();
+        let right = east * self.cos - north * self.sin;
+        let ahead = east * self.sin + north * self.cos;
+        (C + right * PX_PER_NM, C - ahead * PX_PER_NM)
+    }
+
+    /// The screen angle (clockwise from the top) a compass bearing points.
+    pub fn turn(&self, bearing: f32) -> f32 {
+        bearing - self.up
+    }
 }
 
 fn in_scope((x, y): (f32, f32)) -> bool {
@@ -364,13 +396,13 @@ fn ahead(lat: f32, lon: f32, gs: f32, track: f32, secs: f32) -> (f32, f32) {
     )
 }
 
-/// Point at `bearing` degrees (clockwise from north) and `r` pixels out.
+/// Point at `bearing` degrees (clockwise from the top) and `r` pixels out.
 fn polar(bearing: f32, r: f32) -> (f32, f32) {
     let (sin, cos) = bearing.to_radians().sin_cos();
     (C + r * sin, C - r * cos)
 }
 
-fn draw_scope(px: &mut Pixmap, p: &Palette) {
+fn draw_scope(px: &mut Pixmap, p: &Palette, view: &View) {
     // A faint phosphor bloom, brightest at the center.
     let mut fill = paint(p.backdrop, 255);
     if let Some(shader) = RadialGradient::new(
@@ -417,7 +449,8 @@ fn draw_scope(px: &mut Pixmap, p: &Palette) {
         let (a, z) = (polar(b, SCOPE_R), polar(b + 180.0, SCOPE_R));
         line(px, a, z, 1.0, p.glow[2], 255, None);
     }
-    // Bezel: the edge ring with bearing ticks and every 30 degrees labeled.
+    // Bezel: the edge ring with compass bearing ticks, every 30 degrees
+    // labeled, and north marked outside the ring.
     circle(px, SCOPE_R, 2.0, p.glow[7]);
     for deg in (0..360).step_by(5) {
         let len = match deg {
@@ -425,7 +458,7 @@ fn draw_scope(px: &mut Pixmap, p: &Palette) {
             d if d % 10 == 0 => 7.0,
             _ => 4.0,
         };
-        let b = deg as f32;
+        let b = view.turn(deg as f32);
         line(
             px,
             polar(b, SCOPE_R),
@@ -437,22 +470,43 @@ fn draw_scope(px: &mut Pixmap, p: &Palette) {
         );
         if deg % 30 == 0 {
             let (x, y) = polar(b, SCOPE_R - 24.0);
-            let label = format!("{:03}", deg);
+            let (label, size, c) = match deg {
+                0 => ("N".to_string(), 14.0, p.hot),
+                _ => (format!("{deg:03}"), 11.0, p.glow[5]),
+            };
             text_aligned(
                 px,
                 &p.theme.font,
                 &label,
-                11.0,
+                size,
                 x,
-                y + 4.0,
-                p.glow[5],
+                y + size / 2.8,
+                c,
                 Align::Center,
             );
         }
     }
+    let north = view.turn(0.0);
+    let mut pb = PathBuilder::new();
+    let tip = polar(north, SCOPE_R + 2.0);
+    pb.move_to(tip.0, tip.1);
+    for (side, r) in [(-3.0, SCOPE_R + 11.0), (3.0, SCOPE_R + 11.0)] {
+        let (x, y) = polar(north + side, r);
+        pb.line_to(x, y);
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        px.fill_path(
+            &path,
+            &paint(p.hot, 255),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
-fn draw_map(px: &mut Pixmap, p: &Palette, scope: &Mask) {
+fn draw_map(px: &mut Pixmap, p: &Palette, view: &View, scope: &Mask) {
     let stroke = Stroke {
         width: 1.6,
         line_cap: LineCap::Round,
@@ -462,7 +516,7 @@ fn draw_map(px: &mut Pixmap, p: &Palette, scope: &Mask) {
     for coast in geo::COAST {
         let mut pb = PathBuilder::new();
         for (i, &pt) in coast.iter().enumerate() {
-            let (x, y) = project(pt);
+            let (x, y) = view.project(pt);
             if i == 0 {
                 pb.move_to(x, y);
             } else {
@@ -486,7 +540,7 @@ fn draw_map(px: &mut Pixmap, p: &Palette, scope: &Mask) {
         ..Stroke::default()
     };
     dashed.dash = StrokeDash::new(vec![5.0, 5.0], 0.0);
-    for d in runways::directions() {
+    for d in runways::directions(view) {
         let reach = runways::APPROACH_NM * PX_PER_NM;
         let (x, y) = d.threshold;
         let mut pb = PathBuilder::new();
@@ -503,11 +557,11 @@ fn draw_map(px: &mut Pixmap, p: &Palette, scope: &Mask) {
         }
     }
     for rw in geo::RUNWAYS {
-        let [a, b] = rw.ends.map(|(_, pos)| project(pos));
+        let [a, b] = rw.ends.map(|(_, pos)| view.project(pos));
         line(px, a, b, 3.0, p.glow[9], 255, Some(scope));
     }
     for (name, pos) in AIRPORTS {
-        let (x, y) = project(*pos);
+        let (x, y) = view.project(*pos);
         text_aligned(
             px,
             &p.theme.font,
@@ -567,9 +621,11 @@ fn draw_sweep(px: &mut Pixmap, p: &Palette, beam: f32) {
     dot(px, (C, C), 4.0, p.hot, 255);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_track(
     px: &mut Pixmap,
     p: &Palette,
+    view: &View,
     scope: &Mask,
     track: &Track,
     pos: (f32, f32),
@@ -577,7 +633,7 @@ fn draw_track(
     pulse: f32,
 ) {
     let ac = &track.ac;
-    let (x, y) = project(pos);
+    let (x, y) = view.project(pos);
     let ice = is_icelandair(&ac.ident) && !ac.emergency;
     // Brightest just after the beam passes, fading until the next pass.
     // Icelandair stays near full brightness all the way round.
@@ -602,13 +658,13 @@ fn draw_track(
     for (i, &old) in track.history.iter().enumerate() {
         let age = (track.history.len() - i) as f32 / (HISTORY as f32 + 1.0);
         let c = mix(p.backdrop, base, 0.65 * (1.0 - age));
-        let (hx, hy) = project(old);
+        let (hx, hy) = view.project(old);
         if let Some(rect) = tiny_skia::Rect::from_xywh(hx - 1.5, hy - 1.5, 3.0, 3.0) {
             px.fill_rect(rect, &paint(c, 255), Transform::identity(), Some(scope));
         }
     }
     if let (Some(gs), Some(trk)) = (ac.gs, ac.track) {
-        let tip = project(ahead(pos.0, pos.1, gs, trk, VECTOR_SECS));
+        let tip = view.project(ahead(pos.0, pos.1, gs, trk, VECTOR_SECS));
         line(
             px,
             (x, y),
@@ -637,7 +693,7 @@ fn draw_track(
         airliner(
             px,
             (x, y),
-            ac.track.unwrap_or(0.0),
+            view.turn(ac.track.unwrap_or(0.0)),
             mix(GOLD, Rgb(255, 255, 255), 0.25),
             p.backdrop,
         );
@@ -650,11 +706,13 @@ fn draw_track(
 
     // Data block behind the aircraft, clear of its velocity vector, unless
     // that side runs off the scope.
-    let heading_east = ac.track.is_some_and(|t| t.to_radians().sin() > 0.0);
+    let heading_right = ac
+        .track
+        .is_some_and(|t| view.turn(t).to_radians().sin() > 0.0);
     let right = match (x < C - 120.0, x > C + 120.0) {
         (true, _) => true,
         (_, true) => false,
-        _ => !heading_east,
+        _ => !heading_right,
     };
     let (lx, align) = if right {
         (x + 16.0, Align::Left)
@@ -979,15 +1037,36 @@ mod tests {
 
     #[test]
     fn projects_around_center() {
-        let (x, y) = project(CENTER);
+        let view = View::new(0.0);
+        let (x, y) = view.project(CENTER);
         assert!((x - C).abs() < 0.01 && (y - C).abs() < 0.01);
         // 10 nm north is 10 nm worth of pixels up.
-        let (_, y) = project((CENTER.0 + 10.0 / 60.0, CENTER.1));
+        let (_, y) = view.project((CENTER.0 + 10.0 / 60.0, CENTER.1));
         assert!((C - y - 10.0 * PX_PER_NM).abs() < 0.01);
         // Both airports are on the scope.
         for (_, pos) in AIRPORTS {
-            assert!(in_scope(project(*pos)));
+            assert!(in_scope(view.project(*pos)));
         }
+    }
+
+    #[test]
+    fn turns_the_map() {
+        let view = View::new(111.0);
+        let near = |(x, y): (f32, f32), (ex, ey): (f32, f32)| {
+            assert!((x - ex).abs() < 0.05 && (y - ey).abs() < 0.05, "{x},{y}");
+        };
+        let ten_nm = 10.0 * PX_PER_NM;
+        // 10 nm out on bearing 111 is straight up, on 201 to the right.
+        near(
+            view.project(ahead(CENTER.0, CENTER.1, 600.0, 111.0, 60.0)),
+            (C, C - ten_nm),
+        );
+        near(
+            view.project(ahead(CENTER.0, CENTER.1, 600.0, 201.0, 60.0)),
+            (C + ten_nm, C),
+        );
+        assert_eq!(view.turn(111.0), 0.0);
+        assert_eq!(View::new(-90.0).up, 270.0);
     }
 
     #[test]
@@ -1001,8 +1080,15 @@ mod tests {
 
     #[test]
     fn spots_arrivals_and_departures() {
+        for heading in [0.0, 111.0] {
+            spots_movements(&View::new(heading));
+        }
+    }
+
+    fn spots_movements(view: &View) {
         let now = Instant::now();
-        let at = |ac: &adsb::Aircraft| runways::classify(ac, project(dead_reckon(ac, now)));
+        let at =
+            |ac: &adsb::Aircraft| runways::classify(ac, view.project(dead_reckon(ac, now)), view);
         let finals = adsb::Aircraft {
             hex: "4cc2a1".into(),
             ident: "ICE614".into(),

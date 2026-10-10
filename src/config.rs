@@ -15,6 +15,15 @@ pub struct Config {
     pub screens: Vec<String>,
     /// How long each screen stays up when there is more than one.
     pub rotate_seconds: u64,
+    pub radar: Radar,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Radar {
+    /// Compass bearing at the top of the scope, so the map can face the
+    /// way the panel does. 0 is north up.
+    pub heading: f32,
 }
 
 impl Default for Config {
@@ -22,6 +31,7 @@ impl Default for Config {
         Self {
             screens: vec!["dashboard".into()],
             rotate_seconds: 15,
+            radar: Radar::default(),
         }
     }
 }
@@ -68,6 +78,8 @@ mod tests {
         let c = Config::parse("screens = [\"dashboard\", \"x\"]\nrotate_seconds = 30").unwrap();
         assert_eq!(c.screens, ["dashboard", "x"]);
         assert_eq!(c.rotate(), Duration::from_secs(30));
+        let c = Config::parse("[radar]\nheading = 111").unwrap();
+        assert_eq!(c.radar.heading, 111.0);
     }
 
     #[test]

@@ -14,6 +14,8 @@ screens are:
   (`ARR ICE614 BIKF 19`), and each aircraft with its history trail,
   velocity vector and data block
   (callsign, altitude in hundreds of feet, climb/descent, ground speed).
+  The map can be turned to face the way the panel does, so traffic on the
+  screen's right is off to your right.
 
 A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~3.5% of
 one core while the animated radar is up, and ~35 MB of memory (most of that
@@ -124,7 +126,13 @@ Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 ```toml
 screens = ["dashboard", "usage", "radar"]   # shown in order
 rotate_seconds = 15       # time per screen when more than one is listed
+
+[radar]
+heading = 0               # compass bearing at the top of the scope (0 = north up)
 ```
+
+For `heading`, use the direction you face when you look at the panel. The
+bezel's labels stay true compass bearings and an N marks north.
 
 Restart the service after editing it. A broken config is logged and the
 defaults are used.

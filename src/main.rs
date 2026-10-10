@@ -64,7 +64,7 @@ fn main() -> Result<()> {
         Some(None) => bail!("--screen needs a name: {}", screens::NAMES.join(", ")),
         None => config.screens.clone(),
     };
-    let mut carousel = Carousel::new(&names, config.rotate(), &mut log)?;
+    let mut carousel = Carousel::new(&names, &config, &mut log)?;
     let mut theme = Theme::load(false)?;
     let mut renderer = Renderer::new();
 
@@ -211,10 +211,10 @@ struct Carousel {
 }
 
 impl Carousel {
-    fn new(names: &[String], rotate: Duration, log: &mut Log) -> Result<Self> {
+    fn new(names: &[String], config: &Config, log: &mut Log) -> Result<Self> {
         let mut screens = Vec::new();
         for name in names {
-            match screens::build(name) {
+            match screens::build(name, config) {
                 Some(s) => screens.push((name.clone(), s)),
                 None => log.error(format!(
                     "unknown screen {name:?} (available: {})",
@@ -225,7 +225,7 @@ impl Carousel {
         if screens.is_empty() {
             bail!("no usable screens configured");
         }
-        Ok(Self::with_screens(screens, rotate))
+        Ok(Self::with_screens(screens, config.rotate()))
     }
 
     fn with_screens(screens: Vec<(String, Box<dyn Screen>)>, rotate: Duration) -> Self {
