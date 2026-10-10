@@ -10,26 +10,28 @@
 mod config;
 mod device;
 mod draw;
+mod log;
 mod render;
 mod screens;
+mod sender;
 mod theme;
 
 use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use chrono::Local;
 
 use config::Config;
-use device::{HEADER_LEN, Panel};
+use device::HEADER_LEN;
+use log::Log;
 use render::Renderer;
 use screens::Screen;
+use sender::Sender;
 use theme::Theme;
 
-const RETRY: Duration = Duration::from_secs(3);
-/// Wall clock running this far ahead of the monotonic clock means we slept;
-/// the USB handle may be stale, so reconnect.
-const WAKE_GAP: Duration = Duration::from_secs(5);
+/// How often to check for the panel while it's disconnected.
+const OFFLINE_TICK: Duration = Duration::from_millis(500);
 /// How often every screen is asked whether it wants to take over.
 const ALERT_CHECK: Duration = Duration::from_secs(1);
 
@@ -69,67 +71,50 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let sender = Sender::spawn();
     let mut theme_mtime = theme::colors_mtime();
+    let mut dirty = true;
     loop {
-        let mut panel = match Panel::open() {
-            Ok(p) => p,
-            Err(e) => {
-                log.error(format!("{e:#}"));
-                sleep(RETRY);
-                continue;
-            }
-        };
-        log.info(format!("connected to screen (PM={})", panel.pm));
+        let tick = Instant::now();
 
-        let mut clocks = (SystemTime::now(), Instant::now());
-        let mut dirty = true;
-        loop {
-            let tick = Instant::now();
-
-            let now = (SystemTime::now(), tick);
-            let wall = now.0.duration_since(clocks.0).unwrap_or_default();
-            if wall.saturating_sub(now.1 - clocks.1) > WAKE_GAP {
-                log.info("woke from sleep; reconnecting".into());
-                break;
-            }
-            clocks = now;
-
-            // Follow Omarchy theme switches. The theme directory is briefly
-            // missing while Omarchy swaps it in, so ignore that state.
-            let mtime = theme::colors_mtime();
-            if mtime.is_some() && mtime != theme_mtime {
-                match Theme::load(true) {
-                    Ok(t) => {
-                        theme = t;
-                        theme_mtime = mtime;
-                        dirty = true;
-                    }
-                    Err(e) => log.error(format!("reloading theme: {e:#}")),
-                }
-            }
-
-            dirty |= carousel.advance(&mut log);
-            let screen = carousel.current();
-            dirty |= screen.update(Local::now());
-
-            // On a render error, keep showing the previous frame and retry next tick.
-            if dirty {
-                match renderer.render(screen.as_ref(), &theme) {
-                    Ok(()) => dirty = false,
-                    Err(e) => log.error(format!("rendering: {e:#}")),
-                }
-            }
-            if !renderer.frame().is_empty()
-                && let Err(e) = panel.send(renderer.frame())
-            {
-                log.error(format!("{e:#}; reconnecting"));
-                break;
-            }
-
-            // The panel shows its own logo after ~2-3 s without a frame, so
-            // even a still screen is resent every second.
-            sleep(screen.interval().saturating_sub(tick.elapsed()));
+        // Nothing to draw for until the sender has a panel; redraw once it does.
+        if !sender.connected() {
+            dirty = true;
+            sleep(OFFLINE_TICK);
+            continue;
         }
+
+        // Follow Omarchy theme switches. The theme directory is briefly
+        // missing while Omarchy swaps it in, so ignore that state.
+        let mtime = theme::colors_mtime();
+        if mtime.is_some() && mtime != theme_mtime {
+            match Theme::load(true) {
+                Ok(t) => {
+                    theme = t;
+                    theme_mtime = mtime;
+                    dirty = true;
+                }
+                Err(e) => log.error(format!("reloading theme: {e:#}")),
+            }
+        }
+
+        dirty |= carousel.advance(&mut log);
+        let screen = carousel.current();
+        dirty |= screen.update(Local::now());
+
+        // On a render error the sender keeps showing the previous frame;
+        // retry next tick.
+        if dirty {
+            match renderer.render(screen.as_ref(), &theme) {
+                Ok(()) => {
+                    dirty = false;
+                    sender.publish(renderer.frame());
+                }
+                Err(e) => log.error(format!("rendering: {e:#}")),
+            }
+        }
+
+        sleep(screen.interval().saturating_sub(tick.elapsed()));
     }
 }
 
@@ -214,26 +199,5 @@ impl Carousel {
 
     fn current(&mut self) -> &mut Box<dyn Screen> {
         &mut self.screens[self.index].1
-    }
-}
-
-/// Prints each message once, so a condition that persists (cooler unplugged)
-/// doesn't flood the journal.
-#[derive(Default)]
-struct Log {
-    last: String,
-}
-
-impl Log {
-    fn error(&mut self, msg: String) {
-        if msg != self.last {
-            eprintln!("{msg}");
-            self.last = msg;
-        }
-    }
-
-    fn info(&mut self, msg: String) {
-        eprintln!("{msg}");
-        self.last = msg;
     }
 }

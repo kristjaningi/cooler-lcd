@@ -3,8 +3,8 @@
 //!
 //! Adding a screen: create a module implementing [`Screen`] and register it
 //! in [`build`]. Data that is slow to fetch (network, large files) belongs in
-//! a background thread, because `update` runs inside the frame loop and the
-//! panel falls back to its logo after ~2-3 s without a frame.
+//! a background thread, because `update` runs inside the frame loop: the
+//! sender keeps resending the last frame, but the picture freezes meanwhile.
 
 mod dashboard;
 mod radar;
