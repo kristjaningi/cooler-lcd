@@ -93,6 +93,9 @@ cooler-lcd show radar                  # jump to a configured screen
 cooler-lcd flash "Build finished"      # show a message for one rotation
 ```
 
+While the desktop is away, `next` and `show` are refused, but a flash still
+shows over the dim clock for its rotation.
+
 To have the cooler show Claude Code's notifications (permission prompts,
 waiting for input), add a `Notification` hook to `~/.claude/settings.json`:
 

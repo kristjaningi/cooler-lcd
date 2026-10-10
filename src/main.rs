@@ -88,13 +88,19 @@ fn main() -> Result<()> {
     let desktop = Desktop::spawn();
     let mut away_screen = screens::away();
     let mut was_away = false;
+    let mut showed_away = false;
     let mut theme_mtime = theme::colors_mtime();
     let mut dirty = true;
     loop {
         let tick = Instant::now();
 
         for Request { command, reply } in requests.iter().flat_map(|r| r.try_iter()) {
-            let outcome = carousel.command(command);
+            let outcome = match command {
+                Command::Next | Command::Show(_) if desktop.away() => {
+                    Err("the desktop is away, so the panel shows the clock".into())
+                }
+                command => carousel.command(command),
+            };
             dirty |= outcome.is_ok();
             let _ = reply.send(outcome);
         }
@@ -133,12 +139,22 @@ fn main() -> Result<()> {
                 .into(),
             );
             was_away = away;
+        }
+        // Expire a flash before choosing what to show, so the carousel's
+        // screens never get drawn while away, not even for one tick.
+        dirty |= if away {
+            carousel.expire_flash()
+        } else {
+            carousel.advance(&mut log)
+        };
+        let show_away = away && !carousel.flashing();
+        if show_away != showed_away {
+            showed_away = show_away;
             dirty = true;
         }
-        let screen = if away && !carousel.flashing() {
+        let screen = if show_away {
             &mut away_screen
         } else {
-            dirty |= carousel.advance(&mut log);
             carousel.current()
         };
         dirty |= screen.update(Local::now());
@@ -203,13 +219,8 @@ impl Carousel {
     /// Moves to a screen with a new alert, else to the next screen when the
     /// current one's time is up. Returns true on a switch.
     fn advance(&mut self, log: &mut Log) -> bool {
-        if let Some((_, shown_at)) = &self.flash {
-            if shown_at.elapsed() < self.rotate {
-                return false;
-            }
-            self.flash = None;
-            self.shown_at = Instant::now();
-            return true;
+        if self.flash.is_some() {
+            return self.expire_flash();
         }
         if self.screens.len() < 2 {
             return false;
@@ -269,6 +280,20 @@ impl Carousel {
         self.flash = None;
         self.shown_at = Instant::now();
         Ok(())
+    }
+
+    /// Takes down a flash whose time is up. Returns true if it did.
+    fn expire_flash(&mut self) -> bool {
+        if self
+            .flash
+            .as_ref()
+            .is_none_or(|(_, shown_at)| shown_at.elapsed() < self.rotate)
+        {
+            return false;
+        }
+        self.flash = None;
+        self.shown_at = Instant::now();
+        true
     }
 
     fn flashing(&self) -> bool {
