@@ -34,6 +34,13 @@ pub trait Screen {
         Duration::from_secs(1)
     }
 
+    /// JPEG quality for this screen's frames. At 90 and above the encoder
+    /// keeps full-resolution color, so text edges stay clean; animated
+    /// screens can trade a little of that for much faster encoding.
+    fn jpeg_quality(&self) -> u8 {
+        90
+    }
+
     /// Something worth taking over the panel for, checked about once a
     /// second whether or not the screen is visible, so keep it cheap. The
     /// carousel jumps here when this turns `Some` or names something new,

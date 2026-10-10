@@ -13,7 +13,7 @@ screens are:
   each aircraft with its history trail, velocity vector and data block
   (callsign, altitude in hundreds of feet, climb/descent, ground speed).
 
-A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~6% of
+A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~3.5% of
 one core while the animated radar is up, and ~35 MB of memory (most of that
 is NVIDIA's NVML library, loaded for the GPU temperature).
 

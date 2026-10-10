@@ -277,6 +277,13 @@ impl Screen for Radar {
         FRAME
     }
 
+    /// Encoding is most of a frame's cost at 15 fps; at 80 the encoder
+    /// halves its chroma resolution and takes under half the time, which
+    /// the dim phosphor picture doesn't show.
+    fn jpeg_quality(&self) -> u8 {
+        80
+    }
+
     fn loading(&self) -> bool {
         self.status == Status::Acquiring && self.started.elapsed() < Duration::from_secs(5)
     }

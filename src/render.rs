@@ -12,7 +12,6 @@ use crate::screens::Screen;
 use crate::theme::Theme;
 
 pub const SIZE: u32 = 480;
-const JPEG_QUALITY: u8 = 90; // >= 90 keeps full-resolution color, so text edges stay clean
 
 pub struct Renderer {
     canvas: Pixmap,
@@ -31,7 +30,7 @@ impl Renderer {
         screen.draw(&mut self.canvas, theme);
         self.frame.clear();
         self.frame.resize(HEADER_LEN, 0);
-        Encoder::new(&mut self.frame, JPEG_QUALITY).encode(
+        Encoder::new(&mut self.frame, screen.jpeg_quality()).encode(
             self.canvas.data(),
             SIZE as u16,
             SIZE as u16,
