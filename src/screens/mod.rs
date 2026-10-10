@@ -41,13 +41,15 @@ pub trait Screen {
         90
     }
 
-    /// Something worth taking over the panel for, checked about once a
-    /// second whether or not the screen is visible, so keep it cheap. The
-    /// carousel jumps here when this turns `Some` or names something new,
-    /// and holds for one rotation; a condition that persists doesn't pin
-    /// the screen. Keep the text stable while the condition lasts.
-    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
-        None
+    /// Every condition worth taking over the panel for right now, each as a
+    /// short text that stays the same for as long as the condition lasts.
+    /// Asked about once a second while the carousel is showing (not while
+    /// away or flashing, and not with a single screen), whether or not this
+    /// screen is the visible one, so keep it cheap. A condition the carousel
+    /// hasn't seen in a while brings this screen to the front for one
+    /// rotation; one that lasts, or flickers on and off, doesn't again.
+    fn alerts(&mut self, _now: DateTime<Local>) -> Vec<String> {
+        Vec::new()
     }
 
     /// True while the first data is still on its way, so `--preview` can

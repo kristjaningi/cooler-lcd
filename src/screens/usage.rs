@@ -181,18 +181,25 @@ impl Screen for Usage {
         changed
     }
 
-    fn alert(&mut self, now: DateTime<Local>) -> Option<String> {
+    fn alerts(&mut self, now: DateTime<Local>) -> Vec<String> {
         self.reload();
         let now = now.with_timezone(&Utc);
-        self.agents.iter().find_map(|a| {
-            let limit = a.limits.iter().find(|l| nearly_spent(l, now))?;
-            Some(format!(
-                "{} {} over {:.0}%",
-                a.name,
-                short_label(&limit.label),
-                ALERT_USED * 100.0
-            ))
-        })
+        self.agents
+            .iter()
+            .flat_map(|a| {
+                a.limits
+                    .iter()
+                    .filter(move |l| nearly_spent(l, now))
+                    .map(move |l| {
+                        format!(
+                            "{} {} over {:.0}%",
+                            a.name,
+                            short_label(&l.label),
+                            ALERT_USED * 100.0
+                        )
+                    })
+            })
+            .collect()
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {

@@ -256,30 +256,32 @@ impl Screen for Radar {
         scanlines(px);
     }
 
-    /// An emergency squawk, else an Icelandair flight landing. Uses the data
+    /// Emergency squawks and Icelandair flights on approach. Uses the data
     /// already fetched without asking for more, so it only sees traffic
     /// while the radar has been on screen recently.
-    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
+    fn alerts(&mut self, _now: DateTime<Local>) -> Vec<String> {
         self.sync(false);
         let now = Instant::now();
-        let mut live: Vec<&adsb::Aircraft> = self
+        let mut alerts: Vec<String> = self
             .tracks
             .values()
             .map(|t| &t.ac)
             .filter(|ac| now.saturating_duration_since(ac.fixed_at) < adsb::MAX_AGE)
-            .filter(|ac| in_scope(project(dead_reckon(ac, now))))
-            .collect();
-        live.sort_by(|a, b| a.ident.cmp(&b.ident));
-        if let Some(ac) = live.iter().find(|ac| ac.emergency) {
-            return Some(format!("{} squawking emergency", ac.ident));
-        }
-        live.iter()
-            .filter(|ac| is_icelandair(&ac.ident))
-            .find_map(|ac| {
-                let m = runways::classify(ac, project(dead_reckon(ac, now)))?;
-                (m.kind == runways::Kind::Arrival)
+            .filter_map(|ac| {
+                let pos = project(dead_reckon(ac, now));
+                if !in_scope(pos) {
+                    return None;
+                }
+                if ac.emergency {
+                    return Some(format!("{} squawking emergency", ac.ident));
+                }
+                let m = runways::classify(ac, pos)?;
+                (is_icelandair(&ac.ident) && m.kind == runways::Kind::Arrival)
                     .then(|| format!("{} landing {} {}", ac.ident, m.airport, m.runway))
             })
+            .collect();
+        alerts.sort();
+        alerts
     }
 
     fn interval(&self) -> Duration {

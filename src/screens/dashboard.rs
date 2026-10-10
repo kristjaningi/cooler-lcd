@@ -56,7 +56,7 @@ impl Screen for Dashboard {
         changed
     }
 
-    fn alert(&mut self, _now: DateTime<Local>) -> Option<String> {
+    fn alerts(&mut self, _now: DateTime<Local>) -> Vec<String> {
         let (cpu, gpu) = self.sensors.temps();
         for (hot, temp) in self.hot.iter_mut().zip([cpu, gpu]) {
             *hot = hot_now(*hot, temp);
@@ -64,8 +64,9 @@ impl Screen for Dashboard {
         ["CPU", "GPU"]
             .into_iter()
             .zip(self.hot)
-            .find(|(_, hot)| *hot)
+            .filter(|(_, hot)| *hot)
             .map(|(label, _)| format!("{label} over {HOT:.0}°"))
+            .collect()
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {

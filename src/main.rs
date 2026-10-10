@@ -19,6 +19,7 @@ mod screens;
 mod sender;
 mod theme;
 
+use std::collections::{HashMap, VecDeque};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,10 @@ use theme::Theme;
 const OFFLINE_TICK: Duration = Duration::from_millis(500);
 /// How often every screen is asked whether it wants to take over.
 const ALERT_CHECK: Duration = Duration::from_secs(1);
+/// A condition takes over again only after going this long unseen, so one
+/// that flickers at a threshold, or drops out of the radar's data between
+/// its turns on screen, doesn't keep grabbing the panel.
+const REARM: Duration = Duration::from_secs(10 * 60);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -176,14 +181,20 @@ fn main() -> Result<()> {
 }
 
 /// The configured screens, shown one at a time for `rotate` each. A screen
-/// that raises a new alert jumps the queue and stays up for a full `rotate`,
-/// and a flashed message goes in front of them all for as long.
+/// with a new alert jumps the queue and stays up for a full `rotate` (several
+/// take their turns), and a flashed message goes in front of them all for as
+/// long.
 struct Carousel {
     /// A message from `cooler-lcd flash` and when it went up.
     flash: Option<(Box<dyn Screen>, Instant)>,
     screens: Vec<(String, Box<dyn Screen>)>,
-    /// Each screen's alert as of the last check, to spot new ones.
-    alerts: Vec<Option<String>>,
+    /// Each screen's alert conditions and when each was last seen, to spot
+    /// new ones.
+    seen: Vec<HashMap<String, Instant>>,
+    /// Screens with new alerts waiting for their turn, oldest first.
+    pending: VecDeque<usize>,
+    /// Whether the current screen is up because of an alert.
+    taken_over: bool,
     checked_at: Option<Instant>,
     index: usize,
     shown_at: Instant,
@@ -205,15 +216,21 @@ impl Carousel {
         if screens.is_empty() {
             bail!("no usable screens configured");
         }
-        Ok(Self {
+        Ok(Self::with_screens(screens, rotate))
+    }
+
+    fn with_screens(screens: Vec<(String, Box<dyn Screen>)>, rotate: Duration) -> Self {
+        Self {
             flash: None,
-            alerts: vec![None; screens.len()],
+            seen: vec![HashMap::new(); screens.len()],
             screens,
+            pending: VecDeque::new(),
+            taken_over: false,
             checked_at: None,
             index: 0,
             shown_at: Instant::now(),
             rotate,
-        })
+        }
     }
 
     /// Moves to a screen with a new alert, else to the next screen when the
@@ -225,40 +242,48 @@ impl Carousel {
         if self.screens.len() < 2 {
             return false;
         }
-        if let Some(i) = self.new_alert(log) {
-            self.shown_at = Instant::now();
+        self.check_alerts(log);
+        let due = self.shown_at.elapsed() >= self.rotate;
+        // A takeover cuts in right away, unless another one is still
+        // having its turn.
+        if (!self.taken_over || due)
+            && let Some(i) = self.pending.pop_front()
+        {
             let switched = i != self.index;
             self.index = i;
+            self.shown_at = Instant::now();
+            self.taken_over = true;
             return switched;
         }
-        if self.shown_at.elapsed() < self.rotate {
+        if !due {
             return false;
         }
+        self.taken_over = false;
         self.index = (self.index + 1) % self.screens.len();
         self.shown_at = Instant::now();
         true
     }
 
-    /// Asks every screen for its alert, at most once per `ALERT_CHECK`, and
-    /// returns the first screen whose alert is new.
-    fn new_alert(&mut self, log: &mut Log) -> Option<usize> {
+    /// Asks every screen for its alerts, at most once per `ALERT_CHECK`, and
+    /// queues the screens that have a condition not seen within `REARM`.
+    fn check_alerts(&mut self, log: &mut Log) {
         if self.checked_at.is_some_and(|t| t.elapsed() < ALERT_CHECK) {
-            return None;
+            return;
         }
-        self.checked_at = Some(Instant::now());
-        let now = Local::now();
-        let mut first = None;
-        for (i, (name, screen)) in self.screens.iter_mut().enumerate() {
-            let alert = screen.alert(now);
-            if let Some(msg) = &alert
-                && self.alerts[i].as_ref() != Some(msg)
-            {
-                log.info(format!("{name}: {msg}"));
-                first.get_or_insert(i);
+        let now = Instant::now();
+        self.checked_at = Some(now);
+        let local = Local::now();
+        for (i, ((name, screen), seen)) in self.screens.iter_mut().zip(&mut self.seen).enumerate() {
+            seen.retain(|_, at| now.duration_since(*at) < REARM);
+            for alert in screen.alerts(local) {
+                if seen.insert(alert.clone(), now).is_none() {
+                    log.info(format!("{name}: {alert}"));
+                    if !self.pending.contains(&i) {
+                        self.pending.push_back(i);
+                    }
+                }
             }
-            self.alerts[i] = alert;
         }
-        first
     }
 
     /// Carries out a command from the control socket.
@@ -278,6 +303,7 @@ impl Carousel {
             }
         }
         self.flash = None;
+        self.taken_over = false;
         self.shown_at = Instant::now();
         Ok(())
     }
@@ -305,5 +331,94 @@ impl Carousel {
             Some((screen, _)) => screen,
             None => &mut self.screens[self.index].1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use tiny_skia::Pixmap;
+
+    /// A screen whose alerts the test sets.
+    struct Fake(Rc<RefCell<Vec<String>>>);
+
+    impl Screen for Fake {
+        fn update(&mut self, _now: chrono::DateTime<Local>) -> bool {
+            false
+        }
+        fn draw(&self, _px: &mut Pixmap, _theme: &Theme) {}
+        fn alerts(&mut self, _now: chrono::DateTime<Local>) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+    }
+
+    fn carousel(n: usize) -> (Carousel, Vec<Rc<RefCell<Vec<String>>>>) {
+        let alerts: Vec<_> = (0..n).map(|_| Rc::default()).collect();
+        let screens = alerts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                (
+                    format!("s{i}"),
+                    Box::new(Fake(Rc::clone(a))) as Box<dyn Screen>,
+                )
+            })
+            .collect();
+        (
+            Carousel::with_screens(screens, Duration::from_secs(60)),
+            alerts,
+        )
+    }
+
+    /// One tick, skipping the once-a-second throttle.
+    fn tick(c: &mut Carousel) -> bool {
+        c.checked_at = None;
+        c.advance(&mut Log::default())
+    }
+
+    #[test]
+    fn simultaneous_alerts_take_turns() {
+        let (mut c, alerts) = carousel(3);
+        alerts[1].replace(vec!["CPU over 85°".into()]);
+        alerts[2].replace(vec!["ICE614 squawking emergency".into()]);
+        assert!(tick(&mut c));
+        assert_eq!(c.index, 1);
+        // The second waits for the first's turn to end, then gets its own.
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 1);
+        c.shown_at -= c.rotate;
+        assert!(tick(&mut c));
+        assert_eq!(c.index, 2);
+    }
+
+    #[test]
+    fn a_second_condition_on_the_same_screen_takes_over() {
+        let (mut c, alerts) = carousel(2);
+        alerts[1].replace(vec!["CPU over 85°".into()]);
+        tick(&mut c);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 0, "back to rotating");
+        alerts[1].replace(vec!["CPU over 85°".into(), "GPU over 85°".into()]);
+        assert!(tick(&mut c));
+        assert_eq!(c.index, 1);
+    }
+
+    #[test]
+    fn a_flickering_condition_takes_over_once() {
+        let (mut c, alerts) = carousel(2);
+        alerts[1].replace(vec!["ICE614 landing BIKF 19".into()]);
+        tick(&mut c);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 0);
+        alerts[1].replace(vec![]);
+        tick(&mut c);
+        alerts[1].replace(vec!["ICE614 landing BIKF 19".into()]);
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 0);
     }
 }
