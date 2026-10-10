@@ -4,10 +4,12 @@
 //! Usage:
 //!   cooler-lcd [--screen NAME]                  run, cycling through the configured screens
 //!   cooler-lcd [--screen NAME] --preview FILE   render one frame to a JPEG file and exit
+//!   cooler-lcd next | show NAME | flash TEXT    steer the running service (see `control`)
 //!
 //! `--screen` shows just that screen instead of the config's list.
 
 mod config;
+mod control;
 mod desktop;
 mod device;
 mod draw;
@@ -24,6 +26,7 @@ use anyhow::{Result, bail};
 use chrono::Local;
 
 use config::Config;
+use control::{Command, Request};
 use desktop::Desktop;
 use device::HEADER_LEN;
 use log::Log;
@@ -39,6 +42,11 @@ const ALERT_CHECK: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(verb) = args.get(1)
+        && control::VERBS.contains(&verb.as_str())
+    {
+        return control::send(&args[1..].join(" "));
+    }
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
     let mut log = Log::default();
 
@@ -74,6 +82,9 @@ fn main() -> Result<()> {
     }
 
     let sender = Sender::spawn();
+    let requests = control::listen()
+        .inspect_err(|e| log.error(format!("control socket: {e:#}")))
+        .ok();
     let desktop = Desktop::spawn();
     let mut away_screen = screens::away();
     let mut was_away = false;
@@ -81,6 +92,12 @@ fn main() -> Result<()> {
     let mut dirty = true;
     loop {
         let tick = Instant::now();
+
+        for Request { command, reply } in requests.iter().flat_map(|r| r.try_iter()) {
+            let outcome = carousel.command(command);
+            dirty |= outcome.is_ok();
+            let _ = reply.send(outcome);
+        }
 
         // Nothing to draw for until the sender has a panel; redraw once it does.
         if !sender.connected() {
@@ -118,7 +135,7 @@ fn main() -> Result<()> {
             was_away = away;
             dirty = true;
         }
-        let screen = if away {
+        let screen = if away && !carousel.flashing() {
             &mut away_screen
         } else {
             dirty |= carousel.advance(&mut log);
@@ -143,8 +160,11 @@ fn main() -> Result<()> {
 }
 
 /// The configured screens, shown one at a time for `rotate` each. A screen
-/// that raises a new alert jumps the queue and stays up for a full `rotate`.
+/// that raises a new alert jumps the queue and stays up for a full `rotate`,
+/// and a flashed message goes in front of them all for as long.
 struct Carousel {
+    /// A message from `cooler-lcd flash` and when it went up.
+    flash: Option<(Box<dyn Screen>, Instant)>,
     screens: Vec<(String, Box<dyn Screen>)>,
     /// Each screen's alert as of the last check, to spot new ones.
     alerts: Vec<Option<String>>,
@@ -170,6 +190,7 @@ impl Carousel {
             bail!("no usable screens configured");
         }
         Ok(Self {
+            flash: None,
             alerts: vec![None; screens.len()],
             screens,
             checked_at: None,
@@ -182,6 +203,14 @@ impl Carousel {
     /// Moves to a screen with a new alert, else to the next screen when the
     /// current one's time is up. Returns true on a switch.
     fn advance(&mut self, log: &mut Log) -> bool {
+        if let Some((_, shown_at)) = &self.flash {
+            if shown_at.elapsed() < self.rotate {
+                return false;
+            }
+            self.flash = None;
+            self.shown_at = Instant::now();
+            return true;
+        }
         if self.screens.len() < 2 {
             return false;
         }
@@ -221,7 +250,35 @@ impl Carousel {
         first
     }
 
+    /// Carries out a command from the control socket.
+    fn command(&mut self, command: Command) -> Result<(), String> {
+        match command {
+            Command::Next => self.index = (self.index + 1) % self.screens.len(),
+            Command::Show(name) => {
+                self.index = self
+                    .screens
+                    .iter()
+                    .position(|(n, _)| *n == name)
+                    .ok_or_else(|| format!("{name:?} isn't one of the configured screens"))?;
+            }
+            Command::Flash(text) => {
+                self.flash = Some((screens::flash(text), Instant::now()));
+                return Ok(());
+            }
+        }
+        self.flash = None;
+        self.shown_at = Instant::now();
+        Ok(())
+    }
+
+    fn flashing(&self) -> bool {
+        self.flash.is_some()
+    }
+
     fn current(&mut self) -> &mut Box<dyn Screen> {
-        &mut self.screens[self.index].1
+        match &mut self.flash {
+            Some((screen, _)) => screen,
+            None => &mut self.screens[self.index].1,
+        }
     }
 }

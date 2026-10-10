@@ -80,6 +80,34 @@ cargo test                                                 # unit tests
 Only one program can use the screen at a time, so stop the service (or TRCC,
 with `trcc kill`) first.
 
+## Control
+
+The running service takes commands over a socket at
+`$XDG_RUNTIME_DIR/cooler-lcd.sock` (`src/control.rs`):
+
+```sh
+cooler-lcd next                        # show the next screen
+cooler-lcd show radar                  # jump to a configured screen
+cooler-lcd flash "Build finished"      # show a message for one rotation
+```
+
+To have the cooler show Claude Code's notifications (permission prompts,
+waiting for input), add a `Notification` hook to `~/.claude/settings.json`:
+
+```json
+"Notification": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "async": true,
+        "command": "cooler-lcd flash \"$(jq -r '.message // \"Claude needs you\"')\" >/dev/null 2>&1 || true"
+      }
+    ]
+  }
+]
+```
+
 ## Config
 
 Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):

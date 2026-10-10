@@ -134,22 +134,7 @@ pub fn text_aligned(
     color: Rgb,
     align: Align,
 ) {
-    let scaled = font.as_scaled(PxScale::from(size));
-
-    // Pen position of each glyph, relative to the start of the line.
-    let mut glyphs: Vec<(GlyphId, f32)> = Vec::with_capacity(s.len());
-    let mut pen = 0.0;
-    let mut prev: Option<GlyphId> = None;
-    for c in s.chars() {
-        let id = font.glyph_id(c);
-        if let Some(p) = prev {
-            pen += scaled.kern(p, id);
-        }
-        glyphs.push((id, pen));
-        pen += scaled.h_advance(id);
-        prev = Some(id);
-    }
-
+    let (glyphs, pen) = layout(font, s, size);
     let left = match align {
         Align::Left => x,
         Align::Center => x - pen / 2.0,
@@ -179,6 +164,30 @@ pub fn text_aligned(
             }
         });
     }
+}
+
+/// How wide `s` is when drawn at `size`.
+pub fn text_width(font: &FontVec, s: &str, size: f32) -> f32 {
+    layout(font, s, size).1
+}
+
+/// Each glyph's pen position relative to the start of the line, and the
+/// line's total advance.
+fn layout(font: &FontVec, s: &str, size: f32) -> (Vec<(GlyphId, f32)>, f32) {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut glyphs = Vec::with_capacity(s.len());
+    let mut pen = 0.0;
+    let mut prev: Option<GlyphId> = None;
+    for c in s.chars() {
+        let id = font.glyph_id(c);
+        if let Some(p) = prev {
+            pen += scaled.kern(p, id);
+        }
+        glyphs.push((id, pen));
+        pen += scaled.h_advance(id);
+        prev = Some(id);
+    }
+    (glyphs, pen)
 }
 
 fn paint(color: Rgb) -> Paint<'static> {

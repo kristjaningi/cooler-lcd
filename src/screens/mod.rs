@@ -8,6 +8,7 @@
 
 mod away;
 mod dashboard;
+mod flash;
 mod radar;
 mod sensors;
 mod usage;
@@ -65,4 +66,9 @@ pub fn build(name: &str) -> Option<Box<dyn Screen>> {
 /// desktop.
 pub fn away() -> Box<dyn Screen> {
     Box::new(away::Away::new())
+}
+
+/// A message from `cooler-lcd flash`.
+pub fn flash(message: String) -> Box<dyn Screen> {
+    Box::new(flash::Flash::new(message))
 }
