@@ -50,9 +50,11 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   --json` for 5). Each bar's notch marks where an even spend across the
   window would be by now, and records older than 45 minutes are dimmed with
   their age (`src/screens/usage.rs`).
-- **Radar:** aircraft from [adsb.lol](https://adsb.lol)'s free API (community
-  ADS-B receivers, no key), polled every 10 s only while the radar is on
-  screen, backing off on errors and HTTP 429. Positions are dead reckoned
+- **Radar:** aircraft from [adsb.fi](https://adsb.fi)'s open data API
+  (community ADS-B receivers, no key, personal non-commercial use), polled
+  every 10 s only while the radar is on screen, backing off on errors and
+  slowing down on HTTP 429. ([adsb.lol](https://adsb.lol) serves the same
+  format but kept rate limiting it.) Positions are dead reckoned
   between polls, so blips glide at the 15 fps animation rate. The static
   scope, rings and map are drawn once per theme. Coastline from Natural
   Earth, runways from OurAirports (`src/screens/radar/`).

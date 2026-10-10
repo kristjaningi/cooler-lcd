@@ -1,5 +1,8 @@
-//! Live aircraft around a point, from adsb.lol's free API (aircraft heard by
-//! community ADS-B receivers; no account or key).
+//! Live aircraft around a point, from adsb.fi's open data API (aircraft
+//! heard by community ADS-B receivers; no account or key). Free for
+//! personal, non-commercial use with attribution, which the radar's HUD
+//! and the README give. adsb.lol serves the same format but rate-limits by
+//! load without saying how much is allowed, and kept cutting this off.
 //!
 //! Fetched on a background thread, and only while the radar has been on
 //! screen recently, so a carousel that rarely shows it makes few requests.
@@ -12,9 +15,9 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// adsb.lol rate-limits by load without saying how much is allowed;
-/// positions are dead reckoned between polls, so a slow rate still moves
-/// smoothly. This is the fastest we poll; the actual pace adapts.
+/// adsb.fi allows one request a second; positions are dead reckoned between
+/// polls, so a slow rate still moves smoothly. This is the fastest we poll;
+/// the pace slows if we get rate limited anyway.
 const POLL: Duration = Duration::from_secs(10);
 /// Each 429 slows the steady pace by this much, up to `MAX_PACE`...
 const PACE_STEP: Duration = Duration::from_secs(2);
@@ -78,7 +81,7 @@ pub type Shared = Arc<Mutex<State>>;
 
 pub fn spawn(lat: f32, lon: f32, radius_nm: u32) -> Shared {
     let shared = Shared::default();
-    let url = format!("https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}");
+    let url = format!("https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{radius_nm}");
     let s = shared.clone();
     thread::spawn(move || run(&s, &url));
     shared
@@ -109,7 +112,7 @@ fn run(shared: &Shared, url: &str) {
             Ok(aircraft) => {
                 let mut s = shared.lock().unwrap();
                 if s.error.take().is_some() {
-                    eprintln!("radar: adsb.lol reachable again");
+                    eprintln!("radar: adsb.fi reachable again");
                 }
                 s.aircraft = aircraft;
                 s.seq += 1;
@@ -130,7 +133,7 @@ fn run(shared: &Shared, url: &str) {
                 }
                 .min(MAX_BACKOFF);
                 let msg = match e {
-                    FetchError::RateLimited(_) => "adsb.lol: rate limited".to_string(),
+                    FetchError::RateLimited(_) => "adsb.fi: rate limited".to_string(),
                     FetchError::Other(e) => format!("{e:#}"),
                 };
                 let mut s = shared.lock().unwrap();
@@ -169,7 +172,7 @@ impl<E: Into<anyhow::Error>> From<E> for FetchError {
 }
 
 fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<Aircraft>, FetchError> {
-    let mut resp = agent.get(url).call().context("adsb.lol")?;
+    let mut resp = agent.get(url).call().context("adsb.fi")?;
     match resp.status().as_u16() {
         200 => {}
         429 => {
@@ -180,7 +183,7 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<Aircraft>, FetchError> {
                 .map(Duration::from_secs);
             return Err(FetchError::RateLimited(retry_after));
         }
-        status => return Err(anyhow!("adsb.lol: HTTP {status}").into()),
+        status => return Err(anyhow!("adsb.fi: HTTP {status}").into()),
     }
     let body = resp.body_mut().read_to_string()?;
     Ok(parse(&body, Instant::now())?)
@@ -212,7 +215,7 @@ struct Entry {
 }
 
 fn parse(body: &str, now: Instant) -> Result<Vec<Aircraft>> {
-    let resp: Response = serde_json::from_str(body).context("parsing adsb.lol response")?;
+    let resp: Response = serde_json::from_str(body).context("parsing adsb.fi response")?;
     Ok(resp
         .ac
         .into_iter()
@@ -276,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_adsb_lol() {
+    fn parses_readsb_json() {
         let body = r#"{"ac":[
             {"hex":"4cc516","type":"adsb_icao","flight":"ICE27Y  ","r":"TF-FXH",
              "alt_baro":1075,"gs":102.1,"track":357.75,"geom_rate":-576,

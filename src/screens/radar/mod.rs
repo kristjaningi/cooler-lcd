@@ -793,7 +793,7 @@ fn draw_hud(
         Status::NoLink => ("NO LINK".into(), if blink { p.alert } else { p.backdrop }),
     };
     text_aligned(px, font, &label, 14.0, l, b - 16.0, c, Align::Left);
-    text_aligned(px, font, "ADS-B", 12.0, l, b, p.glow[5], Align::Left);
+    text_aligned(px, font, "ADSB.FI", 12.0, l, b, p.glow[5], Align::Left);
     if status == Status::Live && icelandair > 0 {
         text_aligned(
             px,
