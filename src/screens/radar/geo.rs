@@ -350,10 +350,28 @@ pub const COAST: &[&[(f32, f32)]] = &[
     ],
 ];
 
-/// Runway centerlines, end to end.
-pub const RUNWAYS: &[[(f32, f32); 2]] = &[
-    [(63.9645, -22.6054), (63.9919, -22.6054)], // BIKF
-    [(63.9850, -22.6550), (63.9850, -22.5924)], // BIKF
-    [(64.1220, -21.9362), (64.1360, -21.9389)], // BIRK
-    [(64.1325, -21.9554), (64.1276, -21.9327)], // BIRK
+/// A runway's airport and its two ends: each end's designator (the
+/// runway's name when used from that end) and threshold position.
+pub struct Runway {
+    pub airport: &'static str,
+    pub ends: [(&'static str, (f32, f32)); 2],
+}
+
+pub const RUNWAYS: &[Runway] = &[
+    Runway {
+        airport: "BIKF",
+        ends: [("01", (63.9645, -22.6054)), ("19", (63.9919, -22.6054))],
+    },
+    Runway {
+        airport: "BIKF",
+        ends: [("10", (63.9850, -22.6550)), ("28", (63.9850, -22.5924))],
+    },
+    Runway {
+        airport: "BIRK",
+        ends: [("01", (64.1220, -21.9362)), ("19", (64.1360, -21.9389))],
+    },
+    Runway {
+        airport: "BIRK",
+        ends: [("13", (64.1325, -21.9554)), ("31", (64.1276, -21.9327))],
+    },
 ];

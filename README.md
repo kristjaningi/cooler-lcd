@@ -9,8 +9,10 @@ screens are:
 - `usage`: Claude Code and Codex plan usage as horizontal bars, with a pace
   marker and the time until each limit resets.
 - `radar`: a surveillance radar scope over Reykjavik and Keflavik with live
-  air traffic: a rotating sweep, range rings, the coastline and runways, and
-  each aircraft with its history trail, velocity vector and data block
+  air traffic: a rotating sweep, range rings, the coastline, runways and
+  their extended centerlines, arrivals and departures with their runway
+  (`ARR ICE614 BIKF 19`), and each aircraft with its history trail,
+  velocity vector and data block
   (callsign, altitude in hundreds of feet, climb/descent, ground speed).
 
 A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~3.5% of
@@ -33,7 +35,7 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   the queue and stays up for a full rotation: the dashboard when the CPU or
   GPU reaches 85° (it must cool below 75° to trigger again), usage when a
   plan limit passes 90%, and the radar on an emergency squawk or an
-  Icelandair flight landing. A condition that lasts doesn't pin its screen;
+  Icelandair flight on approach. A condition that lasts doesn't pin its screen;
   only a new one takes over again. The radar only sees traffic while it has
   been on screen recently, since it doesn't fetch just to check.
 - **Sensors:** CPU from hwmon (`k10temp` Tdie/Tctl, `coretemp`), GPU from

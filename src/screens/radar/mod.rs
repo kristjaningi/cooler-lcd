@@ -8,6 +8,7 @@
 
 mod adsb;
 mod geo;
+mod runways;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, Mask, Paint, PathBuilder, Pixmap, Point,
-    RadialGradient, SpreadMode, Stroke, SweepGradient, Transform,
+    RadialGradient, SpreadMode, Stroke, StrokeDash, SweepGradient, Transform,
 };
 
 use super::Screen;
@@ -53,11 +54,8 @@ const ICELANDAIR: &str = "ICE";
 /// Icelandair gold, fixed rather than themed so the flag carrier always
 /// stands out from the phosphor.
 const GOLD: Rgb = Rgb(255, 184, 28);
-/// An Icelandair flight descending through this, near an airport, is
-/// landing and takes over the panel.
-const LANDING_ALT: i32 = 3000;
-const LANDING_VRATE: i32 = -300;
-const LANDING_NM: f32 = 10.0;
+/// Arrivals and departures listed in the HUD, at most.
+const MOVEMENTS: usize = 2;
 /// One beacon pulse around each Icelandair aircraft.
 const PULSE: Duration = Duration::from_millis(1800);
 
@@ -239,12 +237,19 @@ impl Screen for Radar {
             .iter()
             .filter(|(t, _)| t.ac.alt.is_some() && is_icelandair(&t.ac.ident))
             .count();
+        let mut movements: Vec<(runways::Movement, &str)> = targets
+            .iter()
+            .filter_map(|(t, pos)| Some((runways::classify(&t.ac, project(*pos))?, &*t.ac.ident)))
+            .collect();
+        movements.sort_by_key(|(m, ident)| (m.kind == runways::Kind::Departure, *ident));
+        movements.truncate(MOVEMENTS);
         draw_hud(
             px,
             &p,
             self.status,
             airborne,
             icelandair,
+            &movements,
             self.utc,
             self.now - self.started,
         );
@@ -269,8 +274,12 @@ impl Screen for Radar {
             return Some(format!("{} squawking emergency", ac.ident));
         }
         live.iter()
-            .find(|ac| is_icelandair(&ac.ident) && landing(ac, now))
-            .map(|ac| format!("{} landing", ac.ident))
+            .filter(|ac| is_icelandair(&ac.ident))
+            .find_map(|ac| {
+                let m = runways::classify(ac, project(dead_reckon(ac, now)))?;
+                (m.kind == runways::Kind::Arrival)
+                    .then(|| format!("{} landing {} {}", ac.ident, m.airport, m.runway))
+            })
     }
 
     fn interval(&self) -> Duration {
@@ -317,18 +326,6 @@ impl<'a> Palette<'a> {
     fn level(&self, level: f32) -> Rgb {
         mix(self.backdrop, self.phosphor, level.clamp(0.0, 1.0))
     }
-}
-
-/// Low, descending and close to one of the airports.
-fn landing(ac: &adsb::Aircraft, now: Instant) -> bool {
-    let low = ac.alt.is_some_and(|alt| alt < LANDING_ALT);
-    let descending = ac.vrate.is_some_and(|v| v <= LANDING_VRATE);
-    let (x, y) = project(dead_reckon(ac, now));
-    let near = AIRPORTS.iter().any(|(_, pos)| {
-        let (ax, ay) = project(*pos);
-        (x - ax).hypot(y - ay) / PX_PER_NM <= LANDING_NM
-    });
-    low && descending && near
 }
 
 /// Screen position of a latitude/longitude (local flat-earth projection).
@@ -480,8 +477,32 @@ fn draw_map(px: &mut Pixmap, p: &Palette, scope: &Mask) {
             );
         }
     }
-    for &[a, b] in geo::RUNWAYS {
-        line(px, project(a), project(b), 3.0, p.glow[9], 255, Some(scope));
+    // Extended centerlines out along each approach, dashed like a
+    // controller's scope.
+    let mut dashed = Stroke {
+        width: 1.0,
+        ..Stroke::default()
+    };
+    dashed.dash = StrokeDash::new(vec![5.0, 5.0], 0.0);
+    for d in runways::directions() {
+        let reach = runways::APPROACH_NM * PX_PER_NM;
+        let (x, y) = d.threshold;
+        let mut pb = PathBuilder::new();
+        pb.move_to(x, y);
+        pb.line_to(x - d.dir.0 * reach, y - d.dir.1 * reach);
+        if let Some(path) = pb.finish() {
+            px.stroke_path(
+                &path,
+                &paint(p.glow[4], 255),
+                &dashed,
+                Transform::identity(),
+                Some(scope),
+            );
+        }
+    }
+    for rw in geo::RUNWAYS {
+        let [a, b] = rw.ends.map(|(_, pos)| project(pos));
+        line(px, a, b, 3.0, p.glow[9], 255, Some(scope));
     }
     for (name, pos) in AIRPORTS {
         let (x, y) = project(*pos);
@@ -747,12 +768,14 @@ fn data_line(ac: &adsb::Aircraft, font: &ab_glyph::FontVec) -> String {
     format!("{alt}{trend}{gs}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_hud(
     px: &mut Pixmap,
     p: &Palette,
     status: Status,
     airborne: usize,
     icelandair: usize,
+    movements: &[(runways::Movement, &str)],
     utc: DateTime<Utc>,
     up: Duration,
 ) {
@@ -811,6 +834,28 @@ fn draw_hud(
             b - 32.0,
             GOLD,
             Align::Left,
+        );
+    }
+    // Arrivals and departures stack up from above the range readout.
+    for (i, (m, ident)) in movements.iter().enumerate() {
+        let kind = match m.kind {
+            runways::Kind::Arrival => "ARR",
+            runways::Kind::Departure => "DEP",
+        };
+        let c = if is_icelandair(ident) {
+            GOLD
+        } else {
+            p.glow[8]
+        };
+        text_aligned(
+            px,
+            font,
+            &format!("{kind} {ident} {} {}", m.airport, m.runway),
+            12.0,
+            r,
+            b - 36.0 - i as f32 * 15.0,
+            c,
+            Align::Right,
         );
     }
     text_aligned(
@@ -953,37 +998,53 @@ mod tests {
     }
 
     #[test]
-    fn spots_landings() {
+    fn spots_arrivals_and_departures() {
         let now = Instant::now();
+        let at = |ac: &adsb::Aircraft| runways::classify(ac, project(dead_reckon(ac, now)));
         let finals = adsb::Aircraft {
             hex: "4cc2a1".into(),
             ident: "ICE614".into(),
-            // About 4 nm out from Keflavik.
+            // About 2.7 nm short of Keflavik's runway 01, heading north.
             lat: 63.92,
             lon: -22.6,
             alt: Some(1400),
             gs: None,
-            track: None,
+            track: Some(2.0),
             vrate: Some(-700),
             emergency: false,
             fixed_at: now,
         };
-        assert!(landing(&finals, now));
+        let arrival = at(&finals).unwrap();
+        assert_eq!(arrival.kind, runways::Kind::Arrival);
+        assert_eq!((arrival.airport, arrival.runway), ("BIKF", "01"));
+
         let climbing = adsb::Aircraft {
             vrate: Some(1500),
             ..finals.clone()
         };
-        assert!(!landing(&climbing, now));
+        assert_eq!(at(&climbing), None, "climbing short of the runway");
         let cruising = adsb::Aircraft {
             alt: Some(34000),
             ..finals.clone()
         };
-        assert!(!landing(&cruising, now));
-        let far = adsb::Aircraft {
-            lat: 64.4,
+        assert_eq!(at(&cruising), None);
+        let crossing = adsb::Aircraft {
+            track: Some(90.0),
+            ..finals.clone()
+        };
+        assert_eq!(at(&crossing), None, "not aligned with the runway");
+
+        // Past the far end of 01, climbing out northbound.
+        let departure = adsb::Aircraft {
+            lat: 64.02,
+            lon: -22.6054,
+            alt: Some(1800),
+            vrate: Some(2200),
             ..finals
         };
-        assert!(!landing(&far, now));
+        let m = at(&departure).unwrap();
+        assert_eq!(m.kind, runways::Kind::Departure);
+        assert_eq!((m.airport, m.runway), ("BIKF", "01"));
     }
 
     #[test]
