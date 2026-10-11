@@ -86,10 +86,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Before the sender, so a second instance exits instead of lying in
+    // wait for the panel. Without a socket the service still runs.
+    let requests = match control::lock() {
+        Err(e) if e.is::<control::AlreadyRunning>() => return Err(e),
+        lock => lock.and_then(control::listen),
+    }
+    .inspect_err(|e| log.error(format!("control socket: {e:#}")))
+    .ok();
     let sender = Sender::spawn();
-    let requests = control::listen()
-        .inspect_err(|e| log.error(format!("control socket: {e:#}")))
-        .ok();
     let desktop = Desktop::spawn();
     let mut away_screen = screens::away();
     let mut was_away = false;

@@ -12,7 +12,7 @@ use std::fs::{File, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -64,16 +64,39 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("cooler-lcd.sock"))
 }
 
-/// Starts listening; requests arrive on the returned channel.
-pub fn listen() -> Result<mpsc::Receiver<Request>> {
-    let dir = runtime_dir()?;
-    let path = dir.join("cooler-lcd.sock");
-    // Held for the life of the process, so two instances starting at once
-    // can't both decide the socket is stale and remove each other's.
+/// Another instance holds the lock, so this one has to go: it would have
+/// no socket, yet still claim the panel whenever the other let go of it.
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("another cooler-lcd is already running")
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// Claims the one-instance lock, held for the life of the process, so two
+/// instances can't both drive the panel, nor both decide the socket is
+/// stale and remove each other's. Fails with `AlreadyRunning` if another
+/// instance holds it.
+pub fn lock() -> Result<File> {
+    lock_in(&runtime_dir()?)
+}
+
+fn lock_in(dir: &Path) -> Result<File> {
     let lock = File::create(dir.join("cooler-lcd.lock")).context("creating the lock file")?;
     if lock.try_lock().is_err() {
-        bail!("another cooler-lcd is already running");
+        return Err(AlreadyRunning.into());
     }
+    Ok(lock)
+}
+
+/// Starts listening, holding on to `lock`; requests arrive on the returned
+/// channel.
+pub fn listen(lock: File) -> Result<mpsc::Receiver<Request>> {
+    let path = socket_path()?;
     // Left over from a previous run that didn't get to clean up.
     let _ = std::fs::remove_file(&path);
     let listener =
@@ -268,5 +291,17 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
+    }
+
+    #[test]
+    fn a_second_instance_is_told_to_go() {
+        let dir = std::env::temp_dir().join(format!("cooler-lcd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = lock_in(&dir).unwrap();
+        let second = lock_in(&dir).unwrap_err();
+        assert!(second.is::<AlreadyRunning>());
+        drop(held);
+        assert!(lock_in(&dir).is_ok(), "free again once the first is gone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
