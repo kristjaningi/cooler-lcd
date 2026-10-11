@@ -106,6 +106,8 @@ struct Row {
     caption: String,
     /// Percentage points ahead of (+) or behind (-) pace.
     vs_pace: Option<i32>,
+    /// Nearly spent, so it set off an alert and has to stay in view.
+    alert: bool,
 }
 
 pub struct Usage {
@@ -373,6 +375,7 @@ fn row(limit: &Limit, now: DateTime<Utc>) -> Row {
             None => String::new(),
         },
         vs_pace: elapsed.map(|e| percent as i32 - (e * 100.0).round() as i32),
+        alert: nearly_spent(limit, now),
     }
 }
 
@@ -390,10 +393,20 @@ fn total_height(sections: &[Section]) -> f32 {
     sections.iter().map(section_height).sum::<f32>() + gaps
 }
 
-/// Drops rows from the bottom (then whole sections) until everything fits.
+/// Drops rows until everything fits: first rows that didn't set off an
+/// alert, from the bottom up, so the takeover shows its reason; then rows
+/// from the bottom (and whole sections).
 fn fit(mut sections: Vec<Section>) -> Vec<Section> {
     let room = SIZE as f32 - 2.0 * MARGIN + 12.0;
     while total_height(&sections) > room {
+        let quiet = sections.iter_mut().rev().find_map(|s| {
+            let i = s.rows.iter().rposition(|r| !r.alert)?;
+            (s.rows.len() > 1).then_some((s, i))
+        });
+        if let Some((s, i)) = quiet {
+            s.rows.remove(i);
+            continue;
+        }
         let Some(last) = sections.last_mut() else {
             break;
         };
@@ -663,5 +676,41 @@ mod tests {
             },
             now
         ));
+    }
+
+    #[test]
+    fn fit_keeps_alerted_rows_in_view() {
+        let row = |label: &str, alert| Row {
+            label: label.into(),
+            percent: if alert { 95 } else { 20 },
+            pace: None,
+            caption: String::new(),
+            vs_pace: None,
+            alert,
+        };
+        let section = |title: &str, rows, stale: bool| Section {
+            title: title.into(),
+            plan: String::new(),
+            rows,
+            note: stale.then(|| "Updated 1h ago".into()),
+            stale,
+        };
+        // Two limits each just fit; one stale note pushes a row off.
+        let sections = vec![
+            section(
+                "Claude",
+                vec![row("Session", false), row("Weekly", false)],
+                true,
+            ),
+            section(
+                "Codex",
+                vec![row("Session", false), row("Weekly", true)],
+                false,
+            ),
+        ];
+        let fitted = fit(sections);
+        let codex: Vec<_> = fitted[1].rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(codex, ["Weekly"]);
+        assert_eq!(fitted[0].rows.len(), 2);
     }
 }
