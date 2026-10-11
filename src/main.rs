@@ -177,6 +177,7 @@ fn main() -> Result<()> {
             carousel.current()
         };
         dirty |= screen.update(Local::now());
+        let interval = screen.interval();
 
         // On a render error the sender keeps showing the previous frame;
         // retry next tick.
@@ -185,12 +186,13 @@ fn main() -> Result<()> {
                 Ok(()) => {
                     dirty = false;
                     sender.publish(renderer.frame());
+                    carousel.flash_drawn();
                 }
                 Err(e) => log.error(format!("rendering: {e:#}")),
             }
         }
 
-        sleep(screen.interval().saturating_sub(tick.elapsed()));
+        sleep(interval.saturating_sub(tick.elapsed()));
     }
 }
 
@@ -199,8 +201,10 @@ fn main() -> Result<()> {
 /// take their turns), and a flashed message goes in front of them all for as
 /// long.
 struct Carousel {
-    /// A message from `cooler-lcd flash` and when it went up.
-    flash: Option<(Box<dyn Screen>, Instant)>,
+    /// A message from `cooler-lcd flash` and when it was first drawn. Its
+    /// time runs from then, so one sent while the panel is unplugged still
+    /// gets its full turn once it's back.
+    flash: Option<(Box<dyn Screen>, Option<Instant>)>,
     screens: Vec<(String, Box<dyn Screen>)>,
     /// Each screen's alert conditions and when each was last seen, to spot
     /// new ones.
@@ -312,7 +316,7 @@ impl Carousel {
                     .ok_or_else(|| format!("{name:?} isn't one of the configured screens"))?;
             }
             Command::Flash(text) => {
-                self.flash = Some((screens::flash(text), Instant::now()));
+                self.flash = Some((screens::flash(text), None));
                 return Ok(());
             }
         }
@@ -327,13 +331,21 @@ impl Carousel {
         if self
             .flash
             .as_ref()
-            .is_none_or(|(_, shown_at)| shown_at.elapsed() < self.rotate)
+            .is_none_or(|(_, drawn_at)| drawn_at.is_none_or(|t| t.elapsed() < self.rotate))
         {
             return false;
         }
         self.flash = None;
         self.shown_at = Instant::now();
         true
+    }
+
+    /// Notes that a frame of the flash went to the panel, starting its time
+    /// if this was the first.
+    fn flash_drawn(&mut self) {
+        if let Some((_, drawn_at @ None)) = &mut self.flash {
+            *drawn_at = Some(Instant::now());
+        }
     }
 
     fn flashing(&self) -> bool {
@@ -434,5 +446,24 @@ mod tests {
         alerts[1].replace(vec!["ICE614 landing BIKF 19".into()]);
         assert!(!tick(&mut c));
         assert_eq!(c.index, 0);
+    }
+
+    #[test]
+    fn a_flash_gets_its_full_turn_once_drawn() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Flash("Claude needs you".into()))
+            .unwrap();
+        // Not yet drawn (the panel is unplugged, say), it doesn't run out.
+        assert!(!tick(&mut c));
+        assert!(c.flashing());
+        c.flash_drawn();
+        assert!(!tick(&mut c));
+        // Later frames don't restart its time.
+        if let Some((_, Some(drawn_at))) = &mut c.flash {
+            *drawn_at -= c.rotate;
+        }
+        c.flash_drawn();
+        assert!(tick(&mut c));
+        assert!(!c.flashing());
     }
 }
