@@ -8,8 +8,6 @@
 //! The numbers come from Omarchy's records (see `records`); a limit that's
 //! nearly spent takes over the panel.
 
-use std::time::Duration;
-
 use chrono::{DateTime, Local, Utc};
 use tiny_skia::Pixmap;
 
@@ -21,9 +19,6 @@ use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
 use records::{Agent, Limit, Records, ellipsize, nearly_spent, short_duration};
 
-/// Records older than this are dimmed with their age: three missed
-/// refreshes at Omarchy's default interval.
-const STALE: Duration = Duration::from_secs(45 * 60);
 const MARGIN: f32 = 24.0;
 const RIGHT: f32 = SIZE as f32 - MARGIN;
 /// Where the lines below the hero start, and how much room they have
@@ -174,7 +169,7 @@ fn layout(agents: &[Agent], now: DateTime<Utc>) -> Content {
         others: Vec::new(),
     };
     for (i, agent) in agents.iter().enumerate() {
-        let stale = age(agent, now);
+        let stale = agent.stale_age(now);
         if Some(i) == hero_at {
             let head = headline(&agent.limits, now);
             let r = Reading::of(&agent.limits[head], now);
@@ -224,14 +219,6 @@ fn line(label: String, limit: &Limit, dim: bool, now: DateTime<Utc>) -> Line {
         dim,
         alert: nearly_spent(limit, now),
     }
-}
-
-/// How old the agent's record is, when it's older than `STALE`.
-fn age(agent: &Agent, now: DateTime<Utc>) -> Option<Duration> {
-    agent
-        .updated_at
-        .and_then(|t| (now - t).to_std().ok())
-        .filter(|age| *age > STALE)
 }
 
 /// The limit to lead with: the first (the shortest window, as Omarchy lists
@@ -497,6 +484,7 @@ fn draw_line(px: &mut Pixmap, theme: &Theme, l: &Line, y: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn limit(label: &str, used: f32, now: DateTime<Utc>) -> Limit {
         Limit {
@@ -511,7 +499,8 @@ mod tests {
         Agent {
             id: id.into(),
             name: id.into(),
-            updated_at: None,
+            fetched_at: None,
+            limits_stale: false,
             limits,
             status: None,
         }

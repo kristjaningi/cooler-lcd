@@ -12,6 +12,9 @@ use serde::Deserialize;
 
 /// A limit at least this used takes over the panel.
 const ALERT_USED: f32 = 0.9;
+/// Limits older than this are shown dimmed with their age: three missed
+/// refreshes at Omarchy's default interval.
+const STALE: Duration = Duration::from_secs(45 * 60);
 
 /// Agents listed first, in this order, and shown even without limits (to
 /// say why). Any other agent appears after them once it reports a limit.
@@ -26,6 +29,14 @@ struct Record {
     name: String,
     #[serde(default)]
     updated_at: Option<String>,
+    /// When the limits were last fetched, in milliseconds since the epoch.
+    /// A record is written on every refresh, but when fetching fails it
+    /// carries the last limits along, flagged stale, so `updated_at` says
+    /// nothing about them. Not every collector writes these.
+    #[serde(default)]
+    limits_fetched_at: Option<f64>,
+    #[serde(default)]
+    limits_stale: bool,
     #[serde(default)]
     limits: Vec<RecordLimit>,
     #[serde(default)]
@@ -47,9 +58,24 @@ struct RecordLimit {
 pub struct Agent {
     pub id: String,
     pub name: String,
-    pub updated_at: Option<DateTime<Utc>>,
+    /// When the limits were fetched (or, failing that, the record written).
+    pub fetched_at: Option<DateTime<Utc>>,
+    /// The collector couldn't refresh the limits.
+    pub limits_stale: bool,
     pub limits: Vec<Limit>,
     pub status: Option<String>,
+}
+
+impl Agent {
+    /// How old the limits are when they can't be trusted: the collector
+    /// says it couldn't refresh them, or they're older than `STALE`.
+    pub fn stale_age(&self, now: DateTime<Utc>) -> Option<Duration> {
+        let age = self.fetched_at.and_then(|t| (now - t).to_std().ok());
+        if self.limits_stale {
+            return Some(age.unwrap_or_default());
+        }
+        age.filter(|age| *age > STALE)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +119,8 @@ impl Records {
     pub fn alerts(&mut self, now: DateTime<Utc>) -> Vec<String> {
         self.agents()
             .iter()
+            // Old numbers are shown, dimmed, but don't take over.
+            .filter(|a| a.stale_age(now).is_none())
             .flat_map(|a| {
                 a.limits
                     .iter()
@@ -185,7 +213,12 @@ fn agent(r: Record) -> Agent {
             r.name
         },
         id: r.id,
-        updated_at: time(r.updated_at.as_deref()),
+        fetched_at: r
+            .limits_fetched_at
+            .filter(|&ms| ms > 0.0)
+            .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
+            .or_else(|| time(r.updated_at.as_deref())),
+        limits_stale: r.limits_stale,
         limits,
         status,
     }
@@ -288,6 +321,63 @@ mod tests {
         assert_eq!(a.limits[0].label, "Session");
         assert!(a.limits[0].resets_at.is_some());
         assert!(a.limits[1].resets_at.is_none());
+    }
+
+    #[test]
+    fn judges_freshness_by_the_limits_not_the_record() {
+        let now = Utc::now();
+        let record = |extra: &str| {
+            let json = format!(
+                r#"{{"id":"claude","updatedAt":"{}",{extra}
+                    "limits":[{{"label":"Session","percent":0.95}}]}}"#,
+                now.to_rfc3339()
+            );
+            agent(serde_json::from_str(&json).unwrap())
+        };
+        // Written just now, but carrying limits fetched an hour ago.
+        let hour_ago = (now - chrono::Duration::hours(1)).timestamp_millis();
+        let a = record(&format!(
+            r#""limitsFetchedAt":{hour_ago},"limitsStale":true,"#
+        ));
+        let age = a.stale_age(now).unwrap();
+        assert!((3590..=3610).contains(&age.as_secs()), "{age:?}");
+
+        // Flagged stale while still recent: stale all the same.
+        let recent = (now - chrono::Duration::minutes(20)).timestamp_millis();
+        let a = record(&format!(
+            r#""limitsFetchedAt":{recent},"limitsStale":true,"#
+        ));
+        assert!(a.stale_age(now).is_some());
+        let a = record(&format!(r#""limitsFetchedAt":{recent},"#));
+        assert!(a.stale_age(now).is_none());
+
+        // Without the fields (Codex), the record's own time counts.
+        assert!(record("").stale_age(now).is_none());
+    }
+
+    #[test]
+    fn stale_limits_dont_take_over() {
+        let now = Utc::now();
+        let mut records = Records {
+            dir: PathBuf::from("/nonexistent"),
+            seen: Vec::new(),
+            agents: vec![Agent {
+                id: "claude".into(),
+                name: "Claude".into(),
+                fetched_at: Some(now),
+                limits_stale: false,
+                limits: vec![Limit {
+                    label: "Session".into(),
+                    used: 0.95,
+                    resets_at: None,
+                    window: None,
+                }],
+                status: None,
+            }],
+        };
+        assert_eq!(records.alerts(now).len(), 1);
+        records.agents[0].limits_stale = true;
+        assert!(records.alerts(now).is_empty());
     }
 
     #[test]
