@@ -20,6 +20,7 @@ pub struct Theme {
     pub green: Rgb,
     pub yellow: Rgb,
     pub red: Rgb,
+    pub cyan: Rgb,
     pub font: FontVec,
 }
 
@@ -63,6 +64,7 @@ impl Theme {
             green: color("green", Rgb(0x9e, 0xce, 0x6a)),
             yellow: color("yellow", Rgb(0xe0, 0xaf, 0x68)),
             red: color("red", Rgb(0xf7, 0x76, 0x8e)),
+            cyan: color("cyan", Rgb(0x7d, 0xcf, 0xff)),
             font,
         }
     }

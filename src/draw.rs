@@ -3,8 +3,8 @@
 
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use tiny_skia::{
-    FillRule, GradientStop, LinearGradient, Paint, Path, PathBuilder, Pixmap, Point, SpreadMode,
-    Transform,
+    FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path, PathBuilder, Pixmap,
+    Point, SpreadMode, Stroke, Transform,
 };
 
 use crate::theme::Rgb;
@@ -93,6 +93,97 @@ pub fn bar(
     let mut shine = paint(Rgb(255, 255, 255));
     shine.set_color_rgba8(255, 255, 255, 38);
     fill_rounded(px, x + r / 2.0, y + 2.0, fw - r, h * 0.35, h * 0.2, &shine);
+}
+
+/// An arc of the circle of radius `r` around (`cx`, `cy`), starting at
+/// `start` degrees (0 is three o'clock, 90 is six) and running clockwise for
+/// `sweep` degrees, stroked `width` wide with round ends. A `glow` lights it
+/// with a soft halo of its own color.
+#[allow(clippy::too_many_arguments)]
+pub fn arc(
+    px: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    start: f32,
+    sweep: f32,
+    width: f32,
+    color: Rgb,
+    glow: bool,
+) {
+    if sweep <= 0.0 {
+        return;
+    }
+    let steps = (sweep / 2.0).ceil().max(1.0) as usize;
+    let mut pb = PathBuilder::new();
+    for i in 0..=steps {
+        let a = (start + sweep * i as f32 / steps as f32).to_radians();
+        let (x, y) = (cx + r * a.cos(), cy + r * a.sin());
+        if i == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    let Some(path) = pb.finish() else { return };
+    if glow {
+        for (grow, alpha) in [(12.0, 16), (7.0, 30), (3.0, 56)] {
+            stroke(px, &path, width + grow, color, alpha);
+        }
+    }
+    stroke(px, &path, width, color, 255);
+}
+
+/// A line through `points` with the area under it, down to `floor`, shaded
+/// in its color fading out toward the bottom.
+pub fn sparkline(px: &mut Pixmap, points: &[(f32, f32)], floor: f32, width: f32, color: Rgb) {
+    let [first, .., last] = points else { return };
+    let line = |pb: &mut PathBuilder| {
+        for (i, &(x, y)) in points.iter().enumerate() {
+            if i == 0 {
+                pb.move_to(x, y);
+            } else {
+                pb.line_to(x, y);
+            }
+        }
+    };
+    let mut pb = PathBuilder::new();
+    line(&mut pb);
+    pb.line_to(last.0, floor);
+    pb.line_to(first.0, floor);
+    pb.close();
+    let top = points.iter().map(|p| p.1).fold(floor, f32::min);
+    if let Some(area) = pb.finish() {
+        let mut fill = paint(color);
+        let c = |a: u8| tiny_skia::Color::from_rgba8(color.0, color.1, color.2, a);
+        if let Some(shader) = LinearGradient::new(
+            Point::from_xy(0.0, top),
+            Point::from_xy(0.0, floor),
+            vec![GradientStop::new(0.0, c(90)), GradientStop::new(1.0, c(0))],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            fill.shader = shader;
+        }
+        px.fill_path(&area, &fill, FillRule::Winding, Transform::identity(), None);
+    }
+    let mut pb = PathBuilder::new();
+    line(&mut pb);
+    if let Some(path) = pb.finish() {
+        stroke(px, &path, width, color, 255);
+    }
+}
+
+fn stroke(px: &mut Pixmap, path: &Path, width: f32, color: Rgb, alpha: u8) {
+    let mut p = paint(color);
+    p.set_color_rgba8(color.0, color.1, color.2, alpha);
+    let stroke = Stroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    px.stroke_path(path, &p, &stroke, Transform::identity(), None);
 }
 
 /// `a` blended toward `b` by `t` (0..=1).

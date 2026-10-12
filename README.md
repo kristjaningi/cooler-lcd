@@ -5,7 +5,9 @@ e.g. Phantom Spirit 120 Vision). It cycles through screens drawn in the colors
 and font of the active Omarchy theme, and follows theme switches live. The
 screens are:
 
-- `dashboard`: the clock, date, and CPU and GPU temperature.
+- `dashboard`: the clock and date, a ring gauge each for the CPU and GPU
+  (temperature outside, load inside), memory, GPU power, and the last ten
+  minutes of temperatures as a chart.
 - `usage`: Claude Code and Codex plan usage as horizontal bars, with a pace
   marker and the time until each limit resets.
 - `radar`: a surveillance radar scope over Reykjavik and Keflavik with live
@@ -17,7 +19,7 @@ screens are:
   The map can be turned to face the way the panel does, so traffic on the
   screen's right is off to your right.
 
-A lightweight replacement for TRCC: ~0.1% CPU for the still screens, ~3.5% of
+A lightweight replacement for TRCC: ~0.5% CPU for the still screens, ~3.5% of
 one core while the animated radar is up, and ~35 MB of memory (most of that
 is NVIDIA's NVML library, loaded for the GPU temperature).
 
@@ -43,8 +45,9 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   flickering at a threshold doesn't keep grabbing the panel. The radar only
   sees traffic while it has been on screen recently, since it doesn't fetch
   just to check.
-- **Sensors:** CPU from hwmon (`k10temp` Tdie/Tctl, `coretemp`), GPU from
-  NVML, polled every 3 s. Missing sensors are retried every 30 s
+- **Sensors:** CPU temperature from hwmon (`k10temp` Tdie/Tctl,
+  `coretemp`), CPU load and memory from `/proc`, GPU temperature, load and
+  power from NVML, polled every 3 s. Missing sensors are retried every 30 s
   (`src/screens/sensors.rs`).
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
