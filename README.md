@@ -1,111 +1,83 @@
-# cooler-lcd
+<h1 align="center">cooler-lcd</h1>
 
-<p>
-  <img src="docs/rig.jpg" width="300" alt="The dashboard on a Thermalright Phantom Spirit 120 Vision's screen, inside a white case above a GeForce RTX card">
+<p align="center">
+  Live screens for the LCD on Thermalright Vision CPU coolers,<br>
+  drawn in the colors and font of your Omarchy theme.
 </p>
 
-<p>
-  <img src="docs/dashboard.jpg" width="320" alt="The dashboard: clock, CPU and GPU ring gauges, and a ten-minute temperature chart">
-  <img src="docs/usage.jpg" width="320" alt="The usage screen: Claude Code's session at 64%, then weekly limits and other agents">
+<p align="center">
+  <img src="docs/rig.jpg" width="280" alt="The dashboard on a Thermalright Phantom Spirit 120 Vision's screen, inside a white case above a GeForce RTX card">
 </p>
 
-A tiny driver for the LCD on Thermalright Vision coolers (USB `87ad:70db`,
-e.g. Phantom Spirit 120 Vision). It cycles through screens drawn in the colors
-and font of the active Omarchy theme, and follows theme switches live. The
-screens are:
+A tiny driver for the 480x480 screen on Thermalright Vision coolers (USB
+`87ad:70db`, e.g. Phantom Spirit 120 Vision), and a lightweight replacement
+for TRCC. It cycles through screens, follows theme switches live, and takes
+commands from scripts and Claude Code hooks.
 
-- `dashboard`: the clock and date, a ring gauge each for the CPU and GPU
-  (temperature outside, load inside), memory, GPU power, and the last ten
-  minutes of temperatures as a chart.
-- `usage`: Claude Code, Codex and other agents' plan usage, in type big
-  enough to read from your chair: the main agent's headline limit as a huge
-  percentage over a bar with a pace marker, and the time until it resets,
-  then one line each for its other limits and the other agents.
-- `radar`: a surveillance radar scope over Reykjavik and Keflavik with live
-  air traffic: a rotating sweep, range rings, the coastline, runways and
-  their extended centerlines, arrivals and departures with their runway
-  (`ARR ICE614 BIKF 19`), and each aircraft with its history trail,
-  velocity vector and data block
-  (callsign, altitude in hundreds of feet, climb/descent, ground speed).
-  The map can be turned to face the way the panel does, so traffic on the
-  screen's right is off to your right.
+## Screens
 
-A lightweight replacement for TRCC: ~0.5% of one core for the still screens,
-~2.5% while the animated radar is up, and ~35 MB of memory (most of that is
-NVIDIA's NVML library, loaded for the GPU readings).
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <p align="center">
+        <img src="docs/dashboard.jpg" width="360" alt="The dashboard: clock, CPU and GPU ring gauges, and a ten-minute temperature chart">
+      </p>
+      <b><code>dashboard</code></b>: the clock and date, a ring gauge each for
+      the CPU and GPU (temperature outside, load inside), memory, GPU power,
+      and the last ten minutes of temperatures as a chart.
+    </td>
+    <td valign="top" width="50%">
+      <p align="center">
+        <img src="docs/usage.jpg" width="360" alt="The usage screen: Claude Code's session at 64%, then weekly limits and other agents">
+      </p>
+      <b><code>usage</code></b>: Claude Code, Codex and other agents' plan
+      usage, in type big enough to read from your chair: the main agent's
+      headline limit as a huge percentage over a bar with a pace marker, and
+      the time until it resets, then one line each for the rest.
+    </td>
+  </tr>
+</table>
 
-## How it works
+**`radar`**: a surveillance radar scope over Reykjavik and Keflavik with live
+air traffic: a rotating sweep, range rings, the coastline, runways and their
+extended centerlines, arrivals and departures with their runway
+(`ARR ICE614 BIKF 19`), and each aircraft with its history trail, velocity
+vector and data block (callsign, altitude in hundreds of feet,
+climb/descent, ground speed). The map can be turned to face the way the
+panel does, so traffic on the screen's right is off to your right.
 
-- **Screen:** a 480x480 panel that only accepts whole pictures. Each frame is a
-  64-byte header + JPEG sent over USB bulk (`src/device.rs`). The firmware
-  falls back to the Thermalright logo after ~2-3 s without a frame, so the last
-  frame is resent every second.
-- **Screens:** each screen in `src/screens/` gathers its own data and draws
-  itself with the helpers in `src/draw.rs`. A frame is redrawn and re-encoded
-  only when the screen reports a change, the theme changes, or the next screen
-  rotates in (`src/render.rs`). Still screens run at one frame a second;
-  animated ones set their own `interval()`.
-- **Rotation bar:** with more than one screen on, a thin bar along the
-  bottom edge fills up as the next screen draws near, at 30 fps. Frames are
-  encoded with a JPEG restart marker after every row of blocks, so moving
-  the bar re-encodes only the bottom row and splices it into the last
-  frame: about 0.1% of a core.
-- **Takeovers:** while the carousel is showing, every screen is asked about
-  once a second what needs attention, even while it's hidden. When something
-  starts, its screen jumps the queue and stays up for a full rotation, and
-  screens with news at the same time take turns: the dashboard when the CPU
-  or GPU reaches 85° (it must cool below 75° to trigger again), usage when a
-  plan limit passes 90%, and the radar on an emergency squawk or an
-  Icelandair flight on approach. A condition that lasts doesn't pin its
-  screen, and one only takes over again after ten minutes unseen, so
-  flickering at a threshold doesn't keep grabbing the panel. The radar only
-  sees traffic while it has been on screen recently, since it doesn't fetch
-  just to check.
-- **Sensors:** CPU temperature from hwmon (`k10temp` Tdie/Tctl,
-  `coretemp`), CPU load and memory from `/proc`, GPU temperature, load and
-  power from NVML, polled every 3 s. Missing sensors are retried every 30 s
-  (`src/screens/sensors.rs`).
-- **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
-  font from `omarchy-font-current` via fontconfig, falling back to the system
-  sans (`src/theme.rs`). Both are reloaded when `colors.toml` or
-  `~/.config/fontconfig/fonts.conf` changes.
-- **Plan usage:** read from the records Omarchy's Agents bar widget
-  (`omarchy.agents`) writes to `~/.local/state/omarchy/agents/usage/`, one
-  JSON file per agent, re-read whenever one changes. No network and no
-  credentials of its own; the numbers are as fresh as the bar's (every 15
-  minutes by default, `omarchy bar set omarchy.agents refreshIntervalSec 300
-  --json` for 5). The big bar's notch marks where an even spend across the
-  window would be by now, and records older than 45 minutes are dimmed with
-  their age (`src/screens/usage/`).
-- **Radar:** aircraft from [adsb.fi](https://adsb.fi)'s open data API
-  (community ADS-B receivers, no key, personal non-commercial use), polled
-  every 10 s only while the radar is on screen, backing off on errors and
-  slowing down on HTTP 429. ([adsb.lol](https://adsb.lol) serves the same
-  format but kept rate limiting it.) Positions are dead reckoned
-  between polls, so blips glide at the 15 fps animation rate. The static
-  scope, rings and map are drawn once per theme. Coastline from Natural
-  Earth, runways from OurAirports (`src/screens/radar/`).
-- **Away:** while the Hyprland session is locked or every monitor is off,
-  a dim clock replaces the screens, which stop updating, so the radar stops
-  fetching and plan usage isn't on display. Checked every 2 s over
-  Hyprland's IPC socket (`src/desktop.rs`).
-- **Recovery:** a sender thread owns the panel and resends the latest frame
-  every second whatever the frame loop is doing (`src/sender.rs`). It
-  reconnects when the cooler is unplugged or a write fails, and after
-  suspend (detected as the wall clock jumping ahead of the monotonic
-  clock).
+With more than one screen on, a thin bar along the bottom edge counts down
+to the next. A screen with news (a hot CPU, a nearly spent limit, an
+emergency squawk) takes over the panel, and while the desktop is locked a
+dim clock stands in for them all.
 
-## Run
+**Lightweight:** ~0.5% of one core for the still screens, ~2.5% while the
+animated radar is up, and ~35 MB of memory (most of that is NVIDIA's NVML
+library, loaded for the GPU readings).
+
+## Install
 
 ```sh
-cargo run --release                                        # drive the screen
-cargo run --release -- --preview out.jpg                   # render one frame to a file
-cargo run --release -- --screen dashboard --preview out.jpg  # preview a specific screen
-cargo test                                                 # unit tests
+cargo install --path .
+sudo cp dist/70-cooler-lcd.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+cp dist/cooler-lcd.service ~/.config/systemd/user/
+systemctl --user enable --now cooler-lcd
 ```
 
-Only one program can use the screen at a time, so stop the service (or TRCC,
-with `trcc kill`) first.
+The udev rule gives the logged-in user access to the screen and keeps USB
+autosuspend off for it.
+
+If TRCC is installed, keep it from grabbing the screen on login: remove any
+`trcc` line from `~/.config/hypr/autostart.lua`, and add `Hidden=true` to
+`~/.config/autostart/trcc.desktop`.
+
+### Day to day
+
+```sh
+journalctl --user -u cooler-lcd                              # logs
+cargo install --path . && systemctl --user restart cooler-lcd # deploy changes
+systemctl --user stop cooler-lcd                             # hand the screen back to TRCC
+```
 
 ## Control
 
@@ -171,36 +143,87 @@ only asked about a spot rounded to 0.1 degrees.
 Restart the service after editing it. A broken config is logged and the
 defaults are used.
 
-## Adding a screen
+## How it works
+
+- **Screen:** a 480x480 panel that only accepts whole pictures. Each frame is a
+  64-byte header + JPEG sent over USB bulk (`src/device.rs`). The firmware
+  falls back to the Thermalright logo after ~2-3 s without a frame, so the last
+  frame is resent every second.
+- **Screens:** each screen in `src/screens/` gathers its own data and draws
+  itself with the helpers in `src/draw.rs`. A frame is redrawn and re-encoded
+  only when the screen reports a change, the theme changes, or the next screen
+  rotates in (`src/render.rs`). Still screens run at one frame a second;
+  animated ones set their own `interval()`.
+- **Rotation bar:** with more than one screen on, a thin bar along the
+  bottom edge fills up as the next screen draws near, at 30 fps. Frames are
+  encoded with a JPEG restart marker after every row of blocks, so moving
+  the bar re-encodes only the bottom row and splices it into the last
+  frame: about 0.1% of a core.
+- **Takeovers:** while the carousel is showing, every screen is asked about
+  once a second what needs attention, even while it's hidden. When something
+  starts, its screen jumps the queue and stays up for a full rotation, and
+  screens with news at the same time take turns: the dashboard when the CPU
+  or GPU reaches 85° (it must cool below 75° to trigger again), usage when a
+  plan limit passes 90%, and the radar on an emergency squawk or an
+  Icelandair flight on approach. A condition that lasts doesn't pin its
+  screen, and one only takes over again after ten minutes unseen, so
+  flickering at a threshold doesn't keep grabbing the panel. The radar only
+  sees traffic while it has been on screen recently, since it doesn't fetch
+  just to check.
+- **Sensors:** CPU temperature from hwmon (`k10temp` Tdie/Tctl,
+  `coretemp`), CPU load and memory from `/proc`, GPU temperature, load and
+  power from NVML, polled every 3 s. Missing sensors are retried every 30 s
+  (`src/screens/sensors.rs`).
+- **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
+  font from `omarchy-font-current` via fontconfig, falling back to the system
+  sans (`src/theme.rs`). Both are reloaded when `colors.toml` or
+  `~/.config/fontconfig/fonts.conf` changes.
+- **Plan usage:** read from the records Omarchy's Agents bar widget
+  (`omarchy.agents`) writes to `~/.local/state/omarchy/agents/usage/`, one
+  JSON file per agent, re-read whenever one changes. No network and no
+  credentials of its own; the numbers are as fresh as the bar's (every 15
+  minutes by default, `omarchy bar set omarchy.agents refreshIntervalSec 300
+  --json` for 5). The big bar's notch marks where an even spend across the
+  window would be by now, and records older than 45 minutes are dimmed with
+  their age (`src/screens/usage/`).
+- **Radar:** aircraft from [adsb.fi](https://adsb.fi)'s open data API
+  (community ADS-B receivers, no key, personal non-commercial use), polled
+  every 10 s only while the radar is on screen, backing off on errors and
+  slowing down on HTTP 429. ([adsb.lol](https://adsb.lol) serves the same
+  format but kept rate limiting it.) Positions are dead reckoned
+  between polls, so blips glide at the 15 fps animation rate. The static
+  scope, rings and map are drawn once per theme. Coastline from Natural
+  Earth, runways from OurAirports (`src/screens/radar/`).
+- **Away:** while the Hyprland session is locked or every monitor is off,
+  a dim clock replaces the screens, which stop updating, so the radar stops
+  fetching and plan usage isn't on display. Checked every 2 s over
+  Hyprland's IPC socket (`src/desktop.rs`).
+- **Recovery:** a sender thread owns the panel and resends the latest frame
+  every second whatever the frame loop is doing (`src/sender.rs`). It
+  reconnects when the cooler is unplugged or a write fails, and after
+  suspend (detected as the wall clock jumping ahead of the monotonic
+  clock).
+
+## Development
+
+```sh
+cargo run --release                                          # drive the screen
+cargo run --release -- --preview out.jpg                     # render one frame to a file
+cargo run --release -- --screen dashboard --preview out.jpg  # preview a specific screen
+cargo test                                                   # unit tests
+```
+
+Only one program can use the screen at a time, so stop the service (or TRCC,
+with `trcc kill`) first. A preview starts from scratch, so the dashboard's
+load and chart are empty; `cooler-lcd snapshot` saves what the running
+service shows instead.
+
+### Adding a screen
 
 Implement the `Screen` trait in a new module under `src/screens/` and register
 it in `build()` and `NAMES` in `src/screens/mod.rs`. `update()` runs inside the
 frame loop, so fetch anything slow (network, big files) on a background thread.
-Implement `alert()` to take over the panel when something happens.
-
-## Install
-
-```sh
-cargo install --path .
-sudo cp dist/70-cooler-lcd.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
-cp dist/cooler-lcd.service ~/.config/systemd/user/
-systemctl --user enable --now cooler-lcd
-```
-
-The udev rule gives the logged-in user access to the screen and keeps USB
-autosuspend off for it.
-
-If TRCC is installed, keep it from grabbing the screen on login: remove any
-`trcc` line from `~/.config/hypr/autostart.lua`, and add `Hidden=true` to
-`~/.config/autostart/trcc.desktop`.
-
-## Day to day
-
-```sh
-journalctl --user -u cooler-lcd                              # logs
-cargo install --path . && systemctl --user restart cooler-lcd # deploy changes
-systemctl --user stop cooler-lcd                             # hand the screen back to TRCC
-```
+Implement `alerts()` to take over the panel when something happens.
 
 ## License
 
