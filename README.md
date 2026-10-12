@@ -21,9 +21,9 @@ screens are:
   The map can be turned to face the way the panel does, so traffic on the
   screen's right is off to your right.
 
-A lightweight replacement for TRCC: ~0.5% CPU for the still screens, ~3.5% of
-one core while the animated radar is up, and ~35 MB of memory (most of that
-is NVIDIA's NVML library, loaded for the GPU temperature).
+A lightweight replacement for TRCC: ~0.5% of one core for the still screens,
+~2.5% while the animated radar is up, and ~35 MB of memory (most of that is
+NVIDIA's NVML library, loaded for the GPU readings).
 
 ## How it works
 
