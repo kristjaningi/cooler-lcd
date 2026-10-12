@@ -55,7 +55,8 @@ usage:
   cooler-lcd [--screen NAME]                    run, cycling through the configured screens
   cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
   cooler-lcd next | show NAME | flash TEXT      steer the running service
-  cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation";
+  cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation
+  cooler-lcd snapshot FILE                      save what the panel shows as a JPEG";
 
 /// The command line, past the program name, when it isn't a verb.
 #[derive(Debug, Default, PartialEq)]
@@ -91,7 +92,13 @@ fn main() -> Result<()> {
     if let Some(verb) = args.get(1)
         && control::VERBS.contains(&verb.as_str())
     {
-        let message = control::send(&args[1..].join(" "))?;
+        let mut line = args[1..].join(" ");
+        // The service doesn't share this directory, so it gets the full path.
+        if verb == "snapshot" && args.len() > 2 {
+            let path = std::path::absolute(args[2..].join(" "))?;
+            line = format!("snapshot {}", path.display());
+        }
+        let message = control::send(&line)?;
         if !message.is_empty() {
             println!("{message}");
         }
@@ -168,6 +175,7 @@ fn main() -> Result<()> {
                 continue;
             }
             let outcome = match command {
+                Command::Snapshot(path) => snapshot(renderer.frame(), &path),
                 Command::Next | Command::Show(_) if desktop.away() => {
                     Err("the desktop is away, so the panel shows the clock".into())
                 }
@@ -274,6 +282,14 @@ fn main() -> Result<()> {
 
         sleep(wake.saturating_duration_since(Instant::now()));
     }
+}
+
+/// Saves `frame`, the one on the panel, to `path` as a JPEG.
+fn snapshot(frame: &[u8], path: &std::path::Path) -> Result<String, String> {
+    let jpeg = frame.get(HEADER_LEN..).filter(|j| !j.is_empty());
+    let jpeg = jpeg.ok_or("nothing on the panel yet")?;
+    std::fs::write(path, jpeg).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(format!("wrote {}", path.display()))
 }
 
 /// The configured screens, shown one at a time for `rotate` each. A screen
@@ -443,6 +459,7 @@ impl Carousel {
                 };
             }
             Command::Flash(text) => self.flash = Some((screens::flash(text), None)),
+            Command::Snapshot(_) => return Err("snapshots are taken by the frame loop".into()),
         }
         Ok(String::new())
     }

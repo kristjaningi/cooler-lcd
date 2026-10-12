@@ -111,6 +111,7 @@ cooler-lcd on radar                    # put a screen in the rotation and show i
 cooler-lcd off radar                   # take it out again
 cooler-lcd toggle radar                # one or the other; prints which
 cooler-lcd flash "Build finished"      # show a message for one rotation
+cooler-lcd snapshot panel.jpg          # save what the panel shows as a JPEG
 ```
 
 A screen that's off is skipped by the rotation and never takes over the

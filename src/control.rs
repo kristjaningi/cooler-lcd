@@ -7,6 +7,7 @@
 //!   cooler-lcd off NAME      take a screen out of the rotation
 //!   cooler-lcd toggle NAME   one or the other
 //!   cooler-lcd flash TEXT    show a message for one rotation
+//!   cooler-lcd snapshot FILE save what the panel shows as a JPEG
 //!
 //! One command per connection, one line each way: the command, then `ok`
 //! (with a message for the user after a space, if there is one) or
@@ -27,7 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
-pub const VERBS: &[&str] = &["next", "show", "on", "off", "toggle", "flash"];
+pub const VERBS: &[&str] = &["next", "show", "on", "off", "toggle", "flash", "snapshot"];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// The whole command has to arrive within this, however it trickles in.
@@ -48,6 +49,9 @@ pub enum Command {
     Off(String),
     Toggle(String),
     Flash(String),
+    /// Where to save the frame on the panel; an absolute path, since the
+    /// service doesn't share the client's working directory.
+    Snapshot(PathBuf),
 }
 
 /// A command from the socket, with where to send its outcome. Once
@@ -227,9 +231,10 @@ fn parse(line: &str) -> Result<Command, String> {
         ("off", name) if !name.is_empty() => Ok(Command::Off(name.into())),
         ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
         ("flash", text) if !text.is_empty() => Ok(Command::Flash(text.into())),
+        ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
         _ => Err(format!(
             "expected one of: next, show NAME, on NAME, off NAME, toggle NAME, \
-             flash TEXT (got {line:?})"
+             flash TEXT, snapshot /ABSOLUTE/PATH (got {line:?})"
         )),
     }
 }
@@ -276,6 +281,10 @@ mod tests {
         assert!(matches!(parse("toggle radar"), Ok(Command::Toggle(n)) if n == "radar"));
         assert!(matches!(parse("off radar"), Ok(Command::Off(n)) if n == "radar"));
         assert!(parse("on").is_err());
+        assert!(
+            matches!(parse("snapshot /tmp/a b.jpg"), Ok(Command::Snapshot(p)) if p == Path::new("/tmp/a b.jpg"))
+        );
+        assert!(parse("snapshot out.jpg").is_err(), "relative to what?");
         assert!(parse("flash").is_err());
         assert!(parse("next please").is_err());
         assert!(parse("reboot").is_err());
