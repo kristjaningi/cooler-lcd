@@ -6,7 +6,7 @@
 //! one of the reasons a monitor can't go solitary: `LOCK` in
 //! `solitaryBlockedBy` (the same check as `omarchy-hyprland-session-locked`).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,10 +19,6 @@ use serde::Deserialize;
 
 const POLL: Duration = Duration::from_secs(2);
 const TIMEOUT: Duration = Duration::from_secs(1);
-/// Failed polls in a row that keep the last answer, so one slow reply
-/// while locked doesn't bring the screens back. After that Hyprland
-/// counts as gone.
-const GRACE: u32 = 3;
 
 pub struct Desktop {
     away: Arc<AtomicBool>,
@@ -33,11 +29,9 @@ impl Desktop {
         let away = Arc::new(AtomicBool::new(false));
         let a = away.clone();
         thread::spawn(move || {
-            let mut failures = 0;
             loop {
-                let reading = monitors().map(|m| is_away(&m));
                 let was = a.load(Ordering::Relaxed);
-                a.store(next(was, &mut failures, reading.ok()), Ordering::Relaxed);
+                a.store(next(was, poll()), Ordering::Relaxed);
                 thread::sleep(POLL);
             }
         });
@@ -65,21 +59,28 @@ fn yes() -> bool {
     true
 }
 
-/// Whether the desktop is away now, given whether it was and this poll's
-/// reading (none if Hyprland couldn't be asked). A failure keeps the last
-/// answer for `GRACE` polls; past that, an unreachable Hyprland (gone, or
-/// another compositor) counts as someone being there, so the screens keep
-/// going.
-fn next(was: bool, failures: &mut u32, reading: Option<bool>) -> bool {
-    match reading {
-        Some(away) => {
-            *failures = 0;
-            away
-        }
-        None => {
-            *failures = failures.saturating_add(1);
-            was && *failures <= GRACE
-        }
+/// What one poll of Hyprland found out.
+#[derive(Debug, PartialEq)]
+enum Poll {
+    /// Hyprland answered: whether the desktop is away.
+    Answer(bool),
+    /// Hyprland isn't running: no socket, or none taking connections
+    /// (another compositor, or Hyprland exited and left its socket behind).
+    Gone,
+    /// Hyprland is there, but asking it failed: a reply too slow, cut off
+    /// or garbled. Says nothing about the desktop.
+    Failed,
+}
+
+/// Whether the desktop is away now, given whether it was and what this
+/// poll found. A failed poll keeps the last answer however long that goes
+/// on, so a lock holds until Hyprland says otherwise; only Hyprland being
+/// gone counts as someone being there, so the screens keep going.
+fn next(was: bool, poll: Poll) -> bool {
+    match poll {
+        Poll::Answer(away) => away,
+        Poll::Gone => false,
+        Poll::Failed => was,
     }
 }
 
@@ -92,26 +93,41 @@ fn is_away(monitors: &[Monitor]) -> bool {
     locked || dark
 }
 
-fn monitors() -> Result<Vec<Monitor>> {
-    let body = ask(b"j/monitors")?;
+fn poll() -> Poll {
+    poll_at(&sockets())
+}
+
+/// Asks each of Hyprland's command sockets in turn about the monitors,
+/// until one answers.
+fn poll_at(sockets: &[PathBuf]) -> Poll {
+    let mut listening = false;
+    for path in sockets {
+        let stream = match UnixStream::connect(path) {
+            Ok(stream) => stream,
+            // Nothing there to ask.
+            Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+                continue;
+            }
+            Err(_) => {
+                listening = true;
+                continue;
+            }
+        };
+        listening = true;
+        if let Ok(monitors) = monitors(stream, path) {
+            return Poll::Answer(is_away(&monitors));
+        }
+    }
+    if listening { Poll::Failed } else { Poll::Gone }
+}
+
+fn monitors(stream: UnixStream, path: &Path) -> Result<Vec<Monitor>> {
+    let body = ask(stream, b"j/monitors").with_context(|| format!("asking {}", path.display()))?;
     serde_json::from_str(&body).context("parsing Hyprland monitors")
 }
 
-/// Sends one request to Hyprland's command socket and returns the reply.
-fn ask(request: &[u8]) -> Result<String> {
-    let mut last_err = None;
-    for path in sockets() {
-        match ask_at(&path, request) {
-            Ok(reply) => return Ok(reply),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no Hyprland socket")))
-}
-
-fn ask_at(path: &Path, request: &[u8]) -> Result<String> {
-    let mut stream =
-        UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
+/// Sends one request on a connected command socket and returns the reply.
+fn ask(mut stream: UnixStream, request: &[u8]) -> Result<String> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     stream.write_all(request)?;
@@ -157,16 +173,48 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_poll_keeps_the_lock_for_a_while() {
-        let mut failures = 0;
-        assert!(next(false, &mut failures, Some(true)));
-        for _ in 0..GRACE {
-            assert!(next(true, &mut failures, None), "still locked");
+    fn a_lock_holds_until_hyprland_answers_or_is_gone() {
+        let mut away = next(false, Poll::Answer(true));
+        for _ in 0..100 {
+            away = next(away, Poll::Failed);
         }
-        assert!(!next(true, &mut failures, None), "Hyprland gone");
-        assert!(next(false, &mut failures, Some(true)));
-        assert_eq!(failures, 0);
-        assert!(!next(false, &mut 0, None), "never locked, never away");
+        assert!(away, "still locked after any number of failed polls");
+        assert!(!next(away, Poll::Answer(false)));
+        assert!(!next(away, Poll::Gone), "Hyprland exited");
+        assert!(!next(false, Poll::Failed), "never locked, never away");
+    }
+
+    #[test]
+    fn tells_a_gone_hyprland_from_a_failing_one() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cooler-lcd-hypr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = |name: &str| dir.join(name);
+
+        // Bound and dropped: the file stays behind, as after a crash.
+        drop(UnixListener::bind(socket("dead")).unwrap());
+        assert_eq!(poll_at(&[socket("dead"), socket("missing")]), Poll::Gone);
+        assert_eq!(poll_at(&[]), Poll::Gone);
+
+        // Takes the connection but never replies.
+        let _stuck = UnixListener::bind(socket("stuck")).unwrap();
+        assert_eq!(poll_at(&[socket("dead"), socket("stuck")]), Poll::Failed);
+
+        // Answers, after the others have failed.
+        let live = UnixListener::bind(socket("live")).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = live.accept().unwrap();
+            let mut request = [0; 10];
+            stream.read_exact(&mut request).unwrap();
+            stream
+                .write_all(br#"[{"solitaryBlockedBy":["LOCK"]}]"#)
+                .unwrap();
+        });
+        assert_eq!(
+            poll_at(&[socket("dead"), socket("stuck"), socket("live")]),
+            Poll::Answer(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
