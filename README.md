@@ -1,6 +1,10 @@
 # cooler-lcd
 
 <p>
+  <img src="docs/rig.jpg" width="300" alt="The dashboard on a Thermalright Phantom Spirit 120 Vision's screen, inside a white case above a GeForce RTX card">
+</p>
+
+<p>
   <img src="docs/dashboard.jpg" width="320" alt="The dashboard: clock, CPU and GPU ring gauges, and a ten-minute temperature chart">
   <img src="docs/usage.jpg" width="320" alt="The usage screen: Claude Code's session at 64%, then weekly limits and other agents">
 </p>
