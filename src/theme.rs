@@ -46,6 +46,12 @@ impl Theme {
         Ok(Self::from_table(&table, load_font()?))
     }
 
+    /// The fallback colors with whatever font there is, for tests.
+    #[cfg(test)]
+    pub fn fallback() -> Self {
+        Self::from_table(&toml::Table::new(), load_font().unwrap())
+    }
+
     fn from_table(table: &toml::Table, font: FontVec) -> Self {
         // Tokyo Night as the fallback, matching Omarchy's default.
         let color = |key: &str, fallback: Rgb| {

@@ -36,6 +36,11 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   only when the screen reports a change, the theme changes, or the next screen
   rotates in (`src/render.rs`). Still screens run at one frame a second;
   animated ones set their own `interval()`.
+- **Rotation bar:** with more than one screen on, a thin bar along the
+  bottom edge fills up as the next screen draws near, at 30 fps. Frames are
+  encoded with a JPEG restart marker after every row of blocks, so moving
+  the bar re-encodes only the bottom row and splices it into the last
+  frame: about 0.1% of a core.
 - **Takeovers:** while the carousel is showing, every screen is asked about
   once a second what needs attention, even while it's hidden. When something
   starts, its screen jumps the queue and stays up for a full rotation, and
@@ -140,6 +145,7 @@ Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 screens = ["dashboard", "usage", "radar"]   # shown in order
 off = ["radar"]           # configured, but out of the rotation until `cooler-lcd on`
 rotate_seconds = 15       # time per screen when more than one is listed
+rotate_bar = true         # the bar counting down to the next screen
 
 [radar]
 heading = 0               # compass bearing at the top of the scope (0 = north up)

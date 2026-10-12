@@ -18,6 +18,8 @@ pub struct Config {
     /// Screens from `screens` that start switched off: out of the rotation
     /// until `cooler-lcd on NAME`.
     pub off: Vec<String>,
+    /// Whether a bar along the bottom edge counts down to the next screen.
+    pub rotate_bar: bool,
     pub radar: Radar,
 }
 
@@ -49,6 +51,7 @@ impl Default for Config {
             screens: vec!["dashboard".into()],
             rotate_seconds: 15,
             off: Vec::new(),
+            rotate_bar: true,
             radar: Radar::default(),
         }
     }
@@ -102,8 +105,9 @@ mod tests {
         let c = Config::parse("[radar]\ncenter = [64.0, -22.0]").unwrap();
         assert_eq!(c.radar.center, Some([64.0, -22.0]));
         assert!(Config::parse("[radar]\ncenter = [-22.0, 640.0]").is_err());
-        let c = Config::parse("off = [\"radar\"]").unwrap();
+        let c = Config::parse("off = [\"radar\"]\nrotate_bar = false").unwrap();
         assert_eq!(c.off, ["radar"]);
+        assert!(!c.rotate_bar);
     }
 
     #[test]

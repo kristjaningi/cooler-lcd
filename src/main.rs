@@ -45,6 +45,10 @@ const ALERT_CHECK: Duration = Duration::from_secs(1);
 /// that flickers at a threshold, or drops out of the radar's data between
 /// its turns on screen, doesn't keep grabbing the panel.
 const REARM: Duration = Duration::from_secs(10 * 60);
+/// Time between frames while the rotation bar is moving, so it glides
+/// rather than jumps on screens that otherwise draw once a second. Cheap,
+/// since moving it re-encodes only the bottom row of the frame.
+const BAR_TICK: Duration = Duration::from_millis(33);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -107,6 +111,8 @@ fn main() -> Result<()> {
     let mut showed_away = false;
     let mut theme_mtime = theme::colors_mtime();
     let mut dirty = true;
+    // The rotation bar's length on the panel, in pixels.
+    let mut shown_bar = None;
     loop {
         let tick = Instant::now();
 
@@ -177,20 +183,34 @@ fn main() -> Result<()> {
             showed_away = show_away;
             dirty = true;
         }
+        let bar = carousel
+            .progress()
+            .filter(|_| config.rotate_bar && !show_away)
+            .map(|p| (p * render::SIZE as f32).round() as u32);
         let screen = if show_away {
             &mut away_screen
         } else {
             carousel.current()
         };
         dirty |= screen.update(Local::now());
-        let interval = screen.interval();
+        let interval = match bar {
+            Some(_) => screen.interval().min(BAR_TICK),
+            None => screen.interval(),
+        };
 
         // On a render error the sender keeps showing the previous frame;
         // retry next tick.
-        if dirty {
-            match renderer.render(screen.as_ref(), &theme) {
+        if dirty || bar != shown_bar {
+            let encoded = if dirty {
+                renderer.draw(screen.as_ref(), &theme);
+                renderer.encode(&theme, bar)
+            } else {
+                renderer.move_bar(&theme, bar)
+            };
+            match encoded {
                 Ok(()) => {
                     dirty = false;
+                    shown_bar = bar;
                     sender.publish(renderer.frame());
                     carousel.flash_drawn();
                 }
@@ -317,6 +337,15 @@ impl Carousel {
             .map(|k| (i + k) % n)
             .find(|&j| self.on[j])
             .unwrap_or(i)
+    }
+
+    /// How far the current screen is through its turn, 0..=1, while another
+    /// screen is due after it: not with one screen on, nor during a flash.
+    fn progress(&self) -> Option<f32> {
+        if self.flash.is_some() || self.next_on(self.index) == self.index {
+            return None;
+        }
+        Some((self.shown_at.elapsed().as_secs_f32() / self.rotate.as_secs_f32()).min(1.0))
     }
 
     /// Asks every screen for its alerts, at most once per `ALERT_CHECK`, and
@@ -537,6 +566,7 @@ mod tests {
         let (mut c, _) = carousel(2);
         c.command(Command::Flash("Claude needs you".into()))
             .unwrap();
+        assert_eq!(c.progress(), None, "no countdown over a flash");
         // Not yet drawn (the panel is unplugged, say), it doesn't run out.
         assert!(!tick(&mut c));
         assert!(c.flashing());
@@ -577,10 +607,12 @@ mod tests {
         let (mut c, _) = carousel(2);
         c.command(Command::Off("s0".into())).unwrap();
         assert_eq!(c.index, 1);
+        assert_eq!(c.progress(), None, "nothing else to count down to");
         assert!(c.command(Command::Off("s1".into())).is_err(), "last one on");
-        // `show` still reaches it for a turn.
+        // `show` still reaches it for a turn, with a countdown back.
         c.command(Command::Show("s0".into())).unwrap();
         assert_eq!(c.index, 0);
+        assert!(c.progress().is_some());
         c.shown_at -= c.rotate;
         tick(&mut c);
         assert_eq!(c.index, 1);

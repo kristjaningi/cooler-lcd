@@ -11,6 +11,9 @@ off = []
 # Seconds each screen stays up when more than one is listed.
 rotate_seconds = 15
 
+# A bar along the bottom edge that fills up as the next screen draws near.
+rotate_bar = true
+
 [radar]
 # Compass bearing at the top of the scope: the direction you face looking
 # at the panel, so traffic on the screen's right is off to your right.
