@@ -8,8 +8,10 @@ screens are:
 - `dashboard`: the clock and date, a ring gauge each for the CPU and GPU
   (temperature outside, load inside), memory, GPU power, and the last ten
   minutes of temperatures as a chart.
-- `usage`: Claude Code and Codex plan usage as horizontal bars, with a pace
-  marker and the time until each limit resets.
+- `usage`: Claude Code, Codex and other agents' plan usage, in type big
+  enough to read from your chair: the main agent's headline limit as a huge
+  percentage over a bar with a pace marker, and the time until it resets,
+  then one line each for its other limits and the other agents.
 - `radar`: a surveillance radar scope over Reykjavik and Keflavik with live
   air traffic: a rotating sweep, range rings, the coastline, runways and
   their extended centerlines, arrivals and departures with their runway
@@ -57,9 +59,9 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   JSON file per agent, re-read whenever one changes. No network and no
   credentials of its own; the numbers are as fresh as the bar's (every 15
   minutes by default, `omarchy bar set omarchy.agents refreshIntervalSec 300
-  --json` for 5). Each bar's notch marks where an even spend across the
+  --json` for 5). The big bar's notch marks where an even spend across the
   window would be by now, and records older than 45 minutes are dimmed with
-  their age (`src/screens/usage.rs`).
+  their age (`src/screens/usage/`).
 - **Radar:** aircraft from [adsb.fi](https://adsb.fi)'s open data API
   (community ADS-B receivers, no key, personal non-commercial use), polled
   every 10 s only while the radar is on screen, backing off on errors and
