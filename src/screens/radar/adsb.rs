@@ -8,7 +8,7 @@
 //! screen recently, so a carousel that rarely shows it makes few requests.
 
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -69,11 +69,21 @@ pub struct State {
     pub fetched_at: Option<Instant>,
     /// Last time the radar was drawn; fetching pauses when this gets old.
     wanted_at: Option<Instant>,
+    /// The fetching thread, to wake when it's paused and wanted again.
+    worker: Option<Thread>,
 }
 
 impl State {
     pub fn want(&mut self) {
+        let paused = !self.wanted();
         self.wanted_at = Some(Instant::now());
+        if paused && let Some(worker) = &self.worker {
+            worker.unpark();
+        }
+    }
+
+    fn wanted(&self) -> bool {
+        self.wanted_at.is_some_and(|t| t.elapsed() < IDLE)
     }
 }
 
@@ -98,14 +108,14 @@ fn run(shared: &Shared, url: &str) {
     // the wait while errors persist.
     let mut pace = POLL;
     let mut backoff = POLL;
+    // Set under the lock that `want` takes, so a radar that comes up after
+    // this is looked at wakes the thread, and one that came up before is
+    // seen below.
+    shared.lock().unwrap().worker = Some(thread::current());
     loop {
-        let wanted = shared
-            .lock()
-            .unwrap()
-            .wanted_at
-            .is_some_and(|t| t.elapsed() < IDLE);
-        if !wanted {
-            thread::sleep(Duration::from_millis(500));
+        // Sleep, without polling, while the radar isn't on screen.
+        if !shared.lock().unwrap().wanted() {
+            thread::park();
             continue;
         }
         let wait = match fetch(&agent, url) {
@@ -263,6 +273,19 @@ fn parse(body: &str, now: Instant) -> Result<Vec<Aircraft>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wanting_the_feed_wakes_its_thread() {
+        let mut state = State {
+            worker: Some(thread::current()),
+            ..State::default()
+        };
+        state.want();
+        // The wake-up is kept for the next park, which returns at once.
+        let started = Instant::now();
+        thread::park_timeout(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn pace_settles_between_limits() {
