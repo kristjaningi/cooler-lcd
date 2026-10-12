@@ -101,8 +101,16 @@ The running service takes commands over a socket at
 ```sh
 cooler-lcd next                        # show the next screen
 cooler-lcd show radar                  # jump to a configured screen
+cooler-lcd on radar                    # put a screen in the rotation and show it
+cooler-lcd off radar                   # take it out again
+cooler-lcd toggle radar                # one or the other; prints which
 cooler-lcd flash "Build finished"      # show a message for one rotation
 ```
+
+A screen that's off is skipped by the rotation and never takes over the
+panel (the radar doesn't fetch traffic either), but `show` still brings it
+up for one turn. It starts off again when the service restarts if the
+config lists it under `off`.
 
 While the desktop is away, `next` and `show` are refused, but a flash still
 shows over the dim clock for its rotation.
@@ -130,6 +138,7 @@ Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 
 ```toml
 screens = ["dashboard", "usage", "radar"]   # shown in order
+off = ["radar"]           # configured, but out of the rotation until `cooler-lcd on`
 rotate_seconds = 15       # time per screen when more than one is listed
 
 [radar]

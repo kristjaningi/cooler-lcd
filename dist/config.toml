@@ -4,6 +4,10 @@
 # Screens to show, in order. Available: dashboard, usage, radar
 screens = ["dashboard"]
 
+# Screens from the list above that start switched off: skipped by the
+# rotation until `cooler-lcd on NAME` (or `toggle NAME`).
+off = []
+
 # Seconds each screen stays up when more than one is listed.
 rotate_seconds = 15
 

@@ -5,6 +5,7 @@
 //!   cooler-lcd [--screen NAME]                  run, cycling through the configured screens
 //!   cooler-lcd [--screen NAME] --preview FILE   render one frame to a JPEG file and exit
 //!   cooler-lcd next | show NAME | flash TEXT    steer the running service (see `control`)
+//!   cooler-lcd on NAME | off NAME | toggle NAME
 //!
 //! `--screen` shows just that screen instead of the config's list.
 
@@ -50,7 +51,11 @@ fn main() -> Result<()> {
     if let Some(verb) = args.get(1)
         && control::VERBS.contains(&verb.as_str())
     {
-        return control::send(&args[1..].join(" "));
+        let message = control::send(&args[1..].join(" "))?;
+        if !message.is_empty() {
+            println!("{message}");
+        }
+        return Ok(());
     }
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
     let mut log = Log::default();
@@ -59,12 +64,13 @@ fn main() -> Result<()> {
         log.error(format!("{e:#}; using defaults"));
         Config::default()
     });
-    let names = match flag("--screen") {
-        Some(Some(name)) => vec![name.clone()],
+    // A screen asked for by name is shown even if the config has it off.
+    let (names, off) = match flag("--screen") {
+        Some(Some(name)) => (vec![name.clone()], Vec::new()),
         Some(None) => bail!("--screen needs a name: {}", screens::NAMES.join(", ")),
-        None => config.screens.clone(),
+        None => (config.screens.clone(), config.off.clone()),
     };
-    let mut carousel = Carousel::new(&names, &config, &mut log)?;
+    let mut carousel = Carousel::new(&names, &off, &config, &mut log)?;
     let mut theme = Theme::load(false)?;
     let mut renderer = Renderer::new();
 
@@ -206,6 +212,10 @@ struct Carousel {
     /// gets its full turn once it's back.
     flash: Option<(Box<dyn Screen>, Option<Instant>)>,
     screens: Vec<(String, Box<dyn Screen>)>,
+    /// Which screens are in the rotation; at least one always is. One
+    /// that's off is only shown when asked for by name, and doesn't take
+    /// over.
+    on: Vec<bool>,
     /// Each screen's alert conditions and when each was last seen, to spot
     /// new ones.
     seen: Vec<HashMap<String, Instant>>,
@@ -220,7 +230,10 @@ struct Carousel {
 }
 
 impl Carousel {
-    fn new(names: &[String], config: &Config, log: &mut Log) -> Result<Self> {
+    fn new(names: &[String], off: &[String], config: &Config, log: &mut Log) -> Result<Self> {
+        for name in off.iter().filter(|n| !names.contains(n)) {
+            log.error(format!("off: {name:?} isn't one of the configured screens"));
+        }
         let mut screens = Vec::new();
         for name in names {
             match screens::build(name, config) {
@@ -234,13 +247,25 @@ impl Carousel {
         if screens.is_empty() {
             bail!("no usable screens configured");
         }
-        Ok(Self::with_screens(screens, config.rotate()))
+        let mut carousel = Self::with_screens(screens, config.rotate());
+        carousel.on = carousel
+            .screens
+            .iter()
+            .map(|(name, _)| !off.contains(name))
+            .collect();
+        if !carousel.on.contains(&true) {
+            log.error("every screen is off; turning the first one on".into());
+            carousel.on[0] = true;
+        }
+        carousel.index = carousel.on.iter().position(|&on| on).unwrap_or(0);
+        Ok(carousel)
     }
 
     fn with_screens(screens: Vec<(String, Box<dyn Screen>)>, rotate: Duration) -> Self {
         Self {
             flash: None,
             seen: vec![HashMap::new(); screens.len()],
+            on: vec![true; screens.len()],
             screens,
             pending: VecDeque::new(),
             taken_over: false,
@@ -277,9 +302,21 @@ impl Carousel {
             return false;
         }
         self.taken_over = false;
-        self.index = (self.index + 1) % self.screens.len();
         self.shown_at = Instant::now();
-        true
+        let next = self.next_on(self.index);
+        let switched = next != self.index;
+        self.index = next;
+        switched
+    }
+
+    /// The first screen in the rotation after `i`, round to `i` itself if
+    /// it's the only one.
+    fn next_on(&self, i: usize) -> usize {
+        let n = self.screens.len();
+        (1..=n)
+            .map(|k| (i + k) % n)
+            .find(|&j| self.on[j])
+            .unwrap_or(i)
     }
 
     /// Asks every screen for its alerts, at most once per `ALERT_CHECK`, and
@@ -293,6 +330,9 @@ impl Carousel {
         let local = Local::now();
         for (i, ((name, screen), seen)) in self.screens.iter_mut().zip(&mut self.seen).enumerate() {
             seen.retain(|_, at| now.duration_since(*at) < REARM);
+            if !self.on[i] {
+                continue;
+            }
             for alert in screen.alerts(local) {
                 if seen.insert(alert.clone(), now).is_none() {
                     log.info(format!("{name}: {alert}"));
@@ -304,26 +344,70 @@ impl Carousel {
         }
     }
 
-    /// Carries out a command from the control socket.
-    fn command(&mut self, command: Command) -> Result<(), String> {
+    /// Carries out a command from the control socket. Returns a message
+    /// for the user, which may be empty.
+    fn command(&mut self, command: Command) -> Result<String, String> {
         match command {
-            Command::Next => self.index = (self.index + 1) % self.screens.len(),
-            Command::Show(name) => {
-                self.index = self
-                    .screens
-                    .iter()
-                    .position(|(n, _)| *n == name)
-                    .ok_or_else(|| format!("{name:?} isn't one of the configured screens"))?;
+            Command::Next => self.switch_to(self.next_on(self.index)),
+            // A screen that's off gets one turn, then the rotation goes on.
+            Command::Show(name) => self.switch_to(self.find(&name)?),
+            Command::On(name) => return self.turn_on(&name),
+            Command::Off(name) => return self.turn_off(&name),
+            Command::Toggle(name) => {
+                return match self.on[self.find(&name)?] {
+                    true => self.turn_off(&name),
+                    false => self.turn_on(&name),
+                };
             }
-            Command::Flash(text) => {
-                self.flash = Some((screens::flash(text), None));
-                return Ok(());
-            }
+            Command::Flash(text) => self.flash = Some((screens::flash(text), None)),
         }
+        Ok(String::new())
+    }
+
+    fn find(&self, name: &str) -> Result<usize, String> {
+        self.screens
+            .iter()
+            .position(|(n, _)| n == name)
+            .ok_or_else(|| format!("{name:?} isn't one of the configured screens"))
+    }
+
+    /// Shows screen `i` now, for a full turn, in place of any flash.
+    fn switch_to(&mut self, i: usize) {
+        self.index = i;
         self.flash = None;
         self.taken_over = false;
         self.shown_at = Instant::now();
-        Ok(())
+    }
+
+    /// Puts a screen in the rotation and shows it. What it would alert
+    /// about is on screen now, so that doesn't take over again.
+    fn turn_on(&mut self, name: &str) -> Result<String, String> {
+        let i = self.find(name)?;
+        self.on[i] = true;
+        let now = Instant::now();
+        for alert in self.screens[i].1.alerts(Local::now()) {
+            self.seen[i].insert(alert, now);
+        }
+        self.switch_to(i);
+        Ok(format!("{name} on"))
+    }
+
+    /// Takes a screen out of the rotation, moving on if it's up.
+    fn turn_off(&mut self, name: &str) -> Result<String, String> {
+        let i = self.find(name)?;
+        if self.on[i] && self.on.iter().filter(|&&on| on).count() == 1 {
+            return Err(format!(
+                "{name} is the only screen on; turn another on first"
+            ));
+        }
+        self.on[i] = false;
+        self.pending.retain(|&p| p != i);
+        if self.index == i {
+            self.index = self.next_on(i);
+            self.taken_over = false;
+            self.shown_at = Instant::now();
+        }
+        Ok(format!("{name} off"))
     }
 
     /// Takes down a flash whose time is up. Returns true if it did.
@@ -465,5 +549,41 @@ mod tests {
         c.flash_drawn();
         assert!(tick(&mut c));
         assert!(!c.flashing());
+    }
+
+    #[test]
+    fn screens_that_are_off_are_skipped_and_dont_take_over() {
+        let (mut c, alerts) = carousel(3);
+        assert_eq!(c.command(Command::Off("s1".into())).unwrap(), "s1 off");
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 2, "skipped s1");
+        alerts[1].replace(vec!["ICE614 squawking emergency".into()]);
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 2);
+
+        // Turning it on shows it, and it's back in the rotation; what it
+        // would have alerted about is already in view.
+        assert_eq!(c.command(Command::Toggle("s1".into())).unwrap(), "s1 on");
+        assert_eq!(c.index, 1);
+        assert!(!tick(&mut c));
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 2);
+    }
+
+    #[test]
+    fn turning_off_the_current_screen_moves_on() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Off("s0".into())).unwrap();
+        assert_eq!(c.index, 1);
+        assert!(c.command(Command::Off("s1".into())).is_err(), "last one on");
+        // `show` still reaches it for a turn.
+        c.command(Command::Show("s0".into())).unwrap();
+        assert_eq!(c.index, 0);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 1);
+        assert!(c.command(Command::On("nope".into())).is_err());
     }
 }

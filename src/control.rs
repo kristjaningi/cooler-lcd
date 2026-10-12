@@ -3,10 +3,14 @@
 //!
 //!   cooler-lcd next          show the next screen
 //!   cooler-lcd show NAME     jump to a configured screen
+//!   cooler-lcd on NAME       put a screen in the rotation and show it
+//!   cooler-lcd off NAME      take a screen out of the rotation
+//!   cooler-lcd toggle NAME   one or the other
 //!   cooler-lcd flash TEXT    show a message for one rotation
 //!
 //! One command per connection, one line each way: the command, then `ok`
-//! or `error: ...`.
+//! (with a message for the user after a space, if there is one) or
+//! `error: ...`.
 
 use std::fs::{File, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -23,7 +27,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
-pub const VERBS: &[&str] = &["next", "show", "flash"];
+pub const VERBS: &[&str] = &["next", "show", "on", "off", "toggle", "flash"];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// The whole command has to arrive within this, however it trickles in.
@@ -40,6 +44,9 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
 pub enum Command {
     Next,
     Show(String),
+    On(String),
+    Off(String),
+    Toggle(String),
     Flash(String),
 }
 
@@ -48,7 +55,8 @@ pub enum Command {
 /// the command is dropped instead of carried out late.
 pub struct Request {
     pub command: Command,
-    pub reply: mpsc::Sender<Result<(), String>>,
+    /// Ok with a message for the user (maybe empty), or why it failed.
+    pub reply: mpsc::Sender<Result<String, String>>,
     pub expires: Instant,
 }
 
@@ -167,7 +175,8 @@ fn serve(stream: UnixStream, requests: &mpsc::Sender<Request>) {
                 .unwrap_or_else(|_| Err("no answer from the frame loop; not carried out".into()))
         });
     let reply = match outcome {
-        Ok(()) => "ok\n".to_string(),
+        Ok(message) if message.is_empty() => "ok\n".to_string(),
+        Ok(message) => format!("ok {message}\n"),
         Err(e) => format!("error: {e}\n"),
     };
     let _ = (&stream).write_all(reply.as_bytes());
@@ -214,15 +223,20 @@ fn parse(line: &str) -> Result<Command, String> {
     match (verb, rest) {
         ("next", "") => Ok(Command::Next),
         ("show", name) if !name.is_empty() => Ok(Command::Show(name.into())),
+        ("on", name) if !name.is_empty() => Ok(Command::On(name.into())),
+        ("off", name) if !name.is_empty() => Ok(Command::Off(name.into())),
+        ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
         ("flash", text) if !text.is_empty() => Ok(Command::Flash(text.into())),
         _ => Err(format!(
-            "expected one of: next, show NAME, flash TEXT (got {line:?})"
+            "expected one of: next, show NAME, on NAME, off NAME, toggle NAME, \
+             flash TEXT (got {line:?})"
         )),
     }
 }
 
-/// Sends one command line to the running service and returns its answer.
-pub fn send(line: &str) -> Result<()> {
+/// Sends one command line to the running service and returns its message
+/// for the user, if any.
+pub fn send(line: &str) -> Result<String> {
     // Newlines would end the command early; a message is one line.
     let line = line.replace(['\n', '\r'], " ");
     if line.len() > MAX_LINE {
@@ -239,9 +253,12 @@ pub fn send(line: &str) -> Result<()> {
     stream.write_all(format!("{line}\n").as_bytes())?;
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply)?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => bail!("{}", other.strip_prefix("error: ").unwrap_or(other)),
+    let reply = reply.trim();
+    match reply.strip_prefix("ok") {
+        Some(message) if message.is_empty() || message.starts_with(' ') => {
+            Ok(message.trim().to_string())
+        }
+        _ => bail!("{}", reply.strip_prefix("error: ").unwrap_or(reply)),
     }
 }
 
@@ -256,6 +273,9 @@ mod tests {
         assert!(
             matches!(parse("flash Claude needs you  \n"), Ok(Command::Flash(t)) if t == "Claude needs you")
         );
+        assert!(matches!(parse("toggle radar"), Ok(Command::Toggle(n)) if n == "radar"));
+        assert!(matches!(parse("off radar"), Ok(Command::Off(n)) if n == "radar"));
+        assert!(parse("on").is_err());
         assert!(parse("flash").is_err());
         assert!(parse("next please").is_err());
         assert!(parse("reboot").is_err());
