@@ -1,13 +1,9 @@
 //! cooler-lcd: drives the LCD on Thermalright Vision coolers with screens
 //! (clock, temperatures, ...) drawn in Omarchy theme colors.
 //!
-//! Usage:
-//!   cooler-lcd [--screen NAME]                  run, cycling through the configured screens
-//!   cooler-lcd [--screen NAME] --preview FILE   render one frame to a JPEG file and exit
-//!   cooler-lcd next | show NAME | flash TEXT    steer the running service (see `control`)
-//!   cooler-lcd on NAME | off NAME | toggle NAME
-//!
-//! `--screen` shows just that screen instead of the config's list.
+//! Usage: see `USAGE`. The verbs steer the running service (see
+//! `control`); `--screen` shows just that screen instead of the config's
+//! list.
 
 mod config;
 mod control;
@@ -53,6 +49,43 @@ const BAR_TICK: Duration = Duration::from_millis(33);
 /// How often to look for a theme switch.
 const THEME_CHECK: Duration = Duration::from_secs(1);
 
+/// Printed for `--help`, and after an argument it doesn't know.
+const USAGE: &str = "\
+usage:
+  cooler-lcd [--screen NAME]                    run, cycling through the configured screens
+  cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
+  cooler-lcd next | show NAME | flash TEXT      steer the running service
+  cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation";
+
+/// The command line, past the program name, when it isn't a verb.
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    help: bool,
+    screen: Option<String>,
+    /// Where to write a preview frame, if that's what's asked for.
+    preview: Option<String>,
+}
+
+fn parse_args(args: &[String]) -> Result<Args> {
+    let mut out = Args::default();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => out.help = true,
+            "--screen" => match args.next_if(|n| !n.starts_with('-')) {
+                Some(name) => out.screen = Some(name.clone()),
+                None => bail!("--screen needs a name: {}", screens::NAMES.join(", ")),
+            },
+            "--preview" => {
+                let file = args.next_if(|f| !f.starts_with('-'));
+                out.preview = Some(file.map_or("preview.jpg".into(), String::clone));
+            }
+            other => bail!("unknown argument {other:?}\n{USAGE}"),
+        }
+    }
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(verb) = args.get(1)
@@ -64,7 +97,11 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
+    let args = parse_args(&args[1..])?;
+    if args.help {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let mut log = Log::default();
 
     let config = Config::load().unwrap_or_else(|e| {
@@ -72,17 +109,15 @@ fn main() -> Result<()> {
         Config::default()
     });
     // A screen asked for by name is shown even if the config has it off.
-    let (names, off) = match flag("--screen") {
-        Some(Some(name)) => (vec![name.clone()], Vec::new()),
-        Some(None) => bail!("--screen needs a name: {}", screens::NAMES.join(", ")),
+    let (names, off) = match args.screen {
+        Some(name) => (vec![name], Vec::new()),
         None => (config.screens.clone(), config.off.clone()),
     };
     let mut carousel = Carousel::new(&names, &off, &config, &mut log)?;
     let mut theme = Theme::load(false)?;
     let mut renderer = Renderer::new();
 
-    if let Some(path) = flag("--preview") {
-        let path = path.map_or("preview.jpg", String::as_str);
+    if let Some(path) = args.preview {
         let screen = carousel.current();
         screen.update(Local::now());
         // Give background fetchers (network data) a moment to deliver.
@@ -94,7 +129,7 @@ fn main() -> Result<()> {
             screen.update(Local::now());
         }
         renderer.render(screen.as_ref(), &theme)?;
-        std::fs::write(path, &renderer.frame()[HEADER_LEN..])?;
+        std::fs::write(&path, &renderer.frame()[HEADER_LEN..])?;
         println!("wrote {path}");
         return Ok(());
     }
@@ -532,6 +567,24 @@ mod tests {
     fn tick(c: &mut Carousel) -> bool {
         c.checked_at = None;
         c.advance(&mut Log::default())
+    }
+
+    #[test]
+    fn parses_arguments() {
+        let parse = |s: &str| {
+            let args: Vec<String> = s.split_whitespace().map(String::from).collect();
+            parse_args(&args)
+        };
+        assert_eq!(parse("").unwrap(), Args::default());
+        assert!(parse("--help").unwrap().help);
+        let a = parse("--preview --screen radar").unwrap();
+        assert_eq!(a.preview.as_deref(), Some("preview.jpg"));
+        assert_eq!(a.screen.as_deref(), Some("radar"));
+        let a = parse("--screen usage --preview out.jpg").unwrap();
+        assert_eq!(a.preview.as_deref(), Some("out.jpg"));
+        assert!(parse("--screen").is_err());
+        assert!(parse("--scren usage").is_err());
+        assert!(parse("help").is_err(), "not a verb, so not run");
     }
 
     #[test]
