@@ -1,5 +1,10 @@
 # cooler-lcd
 
+<p>
+  <img src="docs/dashboard.jpg" width="320" alt="The dashboard: clock, CPU and GPU ring gauges, and a ten-minute temperature chart">
+  <img src="docs/usage.jpg" width="320" alt="The usage screen: Claude Code's session at 64%, then weekly limits and other agents">
+</p>
+
 A tiny driver for the LCD on Thermalright Vision coolers (USB `87ad:70db`,
 e.g. Phantom Spirit 120 Vision). It cycles through screens drawn in the colors
 and font of the active Omarchy theme, and follows theme switches live. The
