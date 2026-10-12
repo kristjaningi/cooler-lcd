@@ -19,6 +19,10 @@ use serde::Deserialize;
 
 const POLL: Duration = Duration::from_secs(2);
 const TIMEOUT: Duration = Duration::from_secs(1);
+/// Failed polls in a row that keep the last answer, so one slow reply
+/// while locked doesn't bring the screens back. After that Hyprland
+/// counts as gone.
+const GRACE: u32 = 3;
 
 pub struct Desktop {
     away: Arc<AtomicBool>,
@@ -29,11 +33,11 @@ impl Desktop {
         let away = Arc::new(AtomicBool::new(false));
         let a = away.clone();
         thread::spawn(move || {
+            let mut failures = 0;
             loop {
-                // Unreachable Hyprland (not running, another compositor)
-                // counts as someone being there, so the screens keep going.
-                let now_away = monitors().is_ok_and(|m| is_away(&m));
-                a.store(now_away, Ordering::Relaxed);
+                let reading = monitors().map(|m| is_away(&m));
+                let was = a.load(Ordering::Relaxed);
+                a.store(next(was, &mut failures, reading.ok()), Ordering::Relaxed);
                 thread::sleep(POLL);
             }
         });
@@ -59,6 +63,24 @@ struct Monitor {
 
 fn yes() -> bool {
     true
+}
+
+/// Whether the desktop is away now, given whether it was and this poll's
+/// reading (none if Hyprland couldn't be asked). A failure keeps the last
+/// answer for `GRACE` polls; past that, an unreachable Hyprland (gone, or
+/// another compositor) counts as someone being there, so the screens keep
+/// going.
+fn next(was: bool, failures: &mut u32, reading: Option<bool>) -> bool {
+    match reading {
+        Some(away) => {
+            *failures = 0;
+            away
+        }
+        None => {
+            *failures = failures.saturating_add(1);
+            was && *failures <= GRACE
+        }
+    }
 }
 
 fn is_away(monitors: &[Monitor]) -> bool {
@@ -132,6 +154,19 @@ mod tests {
 
     fn parse(json: &str) -> Vec<Monitor> {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_failed_poll_keeps_the_lock_for_a_while() {
+        let mut failures = 0;
+        assert!(next(false, &mut failures, Some(true)));
+        for _ in 0..GRACE {
+            assert!(next(true, &mut failures, None), "still locked");
+        }
+        assert!(!next(true, &mut failures, None), "Hyprland gone");
+        assert!(next(false, &mut failures, Some(true)));
+        assert_eq!(failures, 0);
+        assert!(!next(false, &mut 0, None), "never locked, never away");
     }
 
     #[test]
