@@ -81,7 +81,7 @@ impl Screen for Dashboard {
             loads: [percent(r.cpu_load), percent(r.gpu_load)],
             mem: percent(r.mem.map(|(used, total)| used as f32 / total.max(1) as f32)),
             power: r.gpu_power.map(|w| w.round() as u32),
-            chart: chart(self.sensors.history(), Instant::now()),
+            chart: self.sensors.with_history(|h| chart(h, Instant::now())),
         };
         let changed = self.content.as_ref() != Some(&content);
         self.content = Some(content);
@@ -99,6 +99,10 @@ impl Screen for Dashboard {
             .filter(|(_, hot)| *hot)
             .map(|(label, _)| format!("{label} over {HOT:.0}°"))
             .collect()
+    }
+
+    fn loading(&self) -> bool {
+        !self.sensors.ready()
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {

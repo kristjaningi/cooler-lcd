@@ -4,10 +4,17 @@
 //!
 //! Sensors that are missing or fail (driver loaded late, NVML stale after
 //! resume) are looked up again, at most once per `RETRY`.
+//!
+//! The reading happens on a thread of its own, so a driver call that
+//! stalls (NVML after a resume, say) can't freeze the frame loop: asking
+//! for readings returns the latest at once, and starts a fresh poll when
+//! they're due. Nothing is polled while nobody asks.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use nvml_wrapper::Nvml;
@@ -37,31 +44,32 @@ pub struct Readings {
 /// One history sample: when, and the CPU and GPU temperature then.
 pub type Sample = (Instant, Option<f32>, Option<f32>);
 
-pub struct Sensors {
-    cached: Readings,
-    polled_at: Option<Instant>,
-    cpu_path: Option<PathBuf>,
-    nvml: Option<Nvml>,
-    cpu_retry_at: Instant,
-    gpu_retry_at: Instant,
-    /// Busy and total CPU time at the last poll, for the load since.
-    cpu_times: Option<(u64, u64)>,
+/// The readings as the polling thread left them.
+#[derive(Default)]
+struct Latest {
+    readings: Readings,
     history: VecDeque<Sample>,
+    /// When the last poll finished; none before the first.
+    polled_at: Option<Instant>,
+    /// A poll has been asked for and hasn't finished.
+    asked: bool,
+}
+
+type Shared = Arc<(Mutex<Latest>, Condvar)>;
+
+pub struct Sensors {
+    shared: Shared,
 }
 
 impl Sensors {
+    /// Starts the polling thread, and the first poll so the first frame
+    /// has something to show.
     pub fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            cached: Readings::default(),
-            polled_at: None,
-            cpu_path: None,
-            nvml: None,
-            cpu_retry_at: now,
-            gpu_retry_at: now,
-            cpu_times: None,
-            history: VecDeque::new(),
-        }
+        let shared = Shared::default();
+        shared.0.lock().unwrap().asked = true;
+        let s = shared.clone();
+        thread::spawn(move || run(&s));
+        Self { shared }
     }
 
     /// CPU and GPU temperature in °C, refreshed at most every `POLL`.
@@ -70,22 +78,78 @@ impl Sensors {
         (r.cpu_temp, r.gpu_temp)
     }
 
-    /// The latest readings, refreshed at most every `POLL`.
+    /// The latest readings, starting a fresh poll if they're `POLL` old.
     pub fn readings(&mut self) -> Readings {
-        if self.polled_at.is_none_or(|t| t.elapsed() >= POLL) {
-            self.poll();
+        let (latest, wake) = &*self.shared;
+        let mut l = latest.lock().unwrap();
+        if !l.asked && l.polled_at.is_none_or(|t| t.elapsed() >= POLL) {
+            l.asked = true;
+            wake.notify_one();
         }
-        self.cached
+        l.readings
     }
 
-    /// Temperatures over the last `HISTORY`, oldest first, for the times
-    /// something asked for readings.
-    pub fn history(&self) -> &VecDeque<Sample> {
-        &self.history
+    /// Calls `f` with the temperatures over the last `HISTORY`, oldest
+    /// first, for the times something asked for readings.
+    pub fn with_history<T>(&self, f: impl FnOnce(&VecDeque<Sample>) -> T) -> T {
+        f(&self.shared.0.lock().unwrap().history)
     }
 
-    fn poll(&mut self) {
+    /// Whether the first poll has finished.
+    pub fn ready(&self) -> bool {
+        self.shared.0.lock().unwrap().polled_at.is_some()
+    }
+}
+
+/// The polling thread: one poll each time one is asked for.
+fn run(shared: &Shared) {
+    let (latest, wake) = &**shared;
+    let mut probe = Probe::new();
+    loop {
+        drop(
+            wake.wait_while(latest.lock().unwrap(), |l| !l.asked)
+                .unwrap(),
+        );
+        let r = probe.read();
         let now = Instant::now();
+        let mut l = latest.lock().unwrap();
+        l.readings = r;
+        l.history.push_back((now, r.cpu_temp, r.gpu_temp));
+        while l
+            .history
+            .front()
+            .is_some_and(|(t, ..)| now.duration_since(*t) > HISTORY)
+        {
+            l.history.pop_front();
+        }
+        l.polled_at = Some(now);
+        l.asked = false;
+    }
+}
+
+/// The sensors themselves, read on the polling thread.
+struct Probe {
+    cpu_path: Option<PathBuf>,
+    nvml: Option<Nvml>,
+    cpu_retry_at: Instant,
+    gpu_retry_at: Instant,
+    /// Busy and total CPU time at the last poll, for the load since.
+    cpu_times: Option<(u64, u64)>,
+}
+
+impl Probe {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            cpu_path: None,
+            nvml: None,
+            cpu_retry_at: now,
+            gpu_retry_at: now,
+            cpu_times: None,
+        }
+    }
+
+    fn read(&mut self) -> Readings {
         let mut r = Readings {
             cpu_temp: self.cpu_temp(),
             gpu_temp: self.gpu_temp(),
@@ -94,16 +158,7 @@ impl Sensors {
             ..Readings::default()
         };
         self.gpu_details(&mut r);
-        self.history.push_back((now, r.cpu_temp, r.gpu_temp));
-        while self
-            .history
-            .front()
-            .is_some_and(|(t, ..)| now.duration_since(*t) > HISTORY)
-        {
-            self.history.pop_front();
-        }
-        self.cached = r;
-        self.polled_at = Some(now);
+        r
     }
 
     /// CPU package temperature in °C.
