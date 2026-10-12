@@ -201,7 +201,8 @@ fn agent(r: Record) -> Agent {
             Some(Limit {
                 window: window(&l.label),
                 label: short_label(&l.label),
-                used: l.percent?.max(0.0),
+                // Past 1 is past the limit, which the bars can't show.
+                used: l.percent?.clamp(0.0, 1.0),
                 resets_at: time(l.resets_at.as_deref()),
             })
         })
@@ -378,6 +379,15 @@ mod tests {
         assert_eq!(records.alerts(now).len(), 1);
         records.agents[0].limits_stale = true;
         assert!(records.alerts(now).is_empty());
+    }
+
+    #[test]
+    fn caps_usage_at_the_limit() {
+        let json = r#"{"id":"codex","limits":[{"label":"Weekly","percent":1.5},
+            {"label":"Session","percent":-0.1}]}"#;
+        let a = agent(serde_json::from_str(json).unwrap());
+        assert_eq!(a.limits[0].used, 1.0);
+        assert_eq!(a.limits[1].used, 0.0);
     }
 
     #[test]
