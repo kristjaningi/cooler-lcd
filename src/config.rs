@@ -28,11 +28,24 @@ pub struct Config {
 pub struct Radar {
     /// Compass bearing at the top of the scope, so the map can face the
     /// way the panel does. 0 is north up.
+    #[serde(deserialize_with = "heading")]
     pub heading: f32,
     /// Latitude and longitude at the middle of the scope; between Keflavik
     /// and Reykjavik when unset.
     #[serde(deserialize_with = "center")]
     pub center: Option<[f32; 2]>,
+}
+
+/// A finite number of degrees: TOML takes `nan` and `inf` too, which
+/// would turn every point on the scope into NaN, leaving it blank.
+fn heading<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let heading = f32::deserialize(d)?;
+    if !heading.is_finite() {
+        return Err(serde::de::Error::custom(
+            "radar heading is a compass bearing in degrees",
+        ));
+    }
+    Ok(heading)
 }
 
 fn center<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[f32; 2]>, D::Error> {
@@ -105,6 +118,8 @@ mod tests {
         let c = Config::parse("[radar]\ncenter = [64.0, -22.0]").unwrap();
         assert_eq!(c.radar.center, Some([64.0, -22.0]));
         assert!(Config::parse("[radar]\ncenter = [-22.0, 640.0]").is_err());
+        assert!(Config::parse("[radar]\nheading = nan").is_err());
+        assert!(Config::parse("[radar]\nheading = -inf").is_err());
         let c = Config::parse("off = [\"radar\"]\nrotate_bar = false").unwrap();
         assert_eq!(c.off, ["radar"]);
         assert!(!c.rotate_bar);
