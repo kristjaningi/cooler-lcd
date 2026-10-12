@@ -1,12 +1,18 @@
 //! Colors and font from the active Omarchy theme.
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::SystemTime;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use ab_glyph::FontVec;
 use anyhow::{Context, Result, bail};
+
+/// Longest a font lookup may take. Theme switches are loaded in the frame
+/// loop, so one that hung would freeze the panel; it's killed instead.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -106,11 +112,7 @@ fn parse_hex(s: &str) -> Option<Rgb> {
 /// The bold variant of Omarchy's current font, falling back to the system
 /// sans-serif. Each candidate is parsed so an unusable file is skipped.
 fn load_font() -> Result<FontVec> {
-    let current = Command::new("omarchy-font-current")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|f| !f.is_empty());
+    let current = run(&mut Command::new("omarchy-font-current"));
     for family in current
         .iter()
         .map(String::as_str)
@@ -130,17 +132,49 @@ fn load_font() -> Result<FontVec> {
 }
 
 fn fc_match(pattern: &str) -> Option<String> {
-    let out = Command::new("fc-match")
-        .args(["-f", "%{file}", pattern])
-        .output()
+    run(Command::new("fc-match").args(["-f", "%{file}", pattern]))
+}
+
+/// Runs `command` and returns its trimmed output, if it has any and the
+/// command finishes within `LOOKUP_TIMEOUT`. The output is a line, well
+/// within a pipe's buffer, so it can wait for the exit before reading.
+fn run(command: &mut Command) -> Option<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!path.is_empty()).then_some(path)
+    let deadline = Instant::now() + LOOKUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let out = out.trim();
+    (!out.is_empty()).then(|| out.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runs_lookups_with_a_deadline() {
+        assert_eq!(run(Command::new("echo").arg(" hi ")).as_deref(), Some("hi"));
+        assert_eq!(run(&mut Command::new("true")), None, "no output");
+        let started = Instant::now();
+        assert_eq!(run(Command::new("sleep").arg("10")), None);
+        assert!(started.elapsed() < LOOKUP_TIMEOUT + Duration::from_secs(1));
+    }
 
     #[test]
     fn parses_hex_colors() {
