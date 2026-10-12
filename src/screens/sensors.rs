@@ -1,5 +1,6 @@
 //! Sensor readings: CPU temperature from hwmon, GPU temperature from NVML,
-//! load and memory from `/proc` and NVML, and a short temperature history.
+//! CPU load and memory from `/proc`, GPU load and power from NVML, and a
+//! short temperature history.
 //!
 //! Sensors that are missing or fail (driver loaded late, NVML stale after
 //! resume) are looked up again, at most once per `RETRY`.
@@ -29,7 +30,6 @@ pub struct Readings {
     pub gpu_load: Option<f32>,
     /// Used and total bytes.
     pub mem: Option<(u64, u64)>,
-    pub vram: Option<(u64, u64)>,
     /// Watts.
     pub gpu_power: Option<f32>,
 }
@@ -135,13 +135,12 @@ impl Sensors {
         value.map(|t| t as f32)
     }
 
-    /// GPU load, memory and power, when the temperature just read fine.
+    /// GPU load and power.
     fn gpu_details(&self, r: &mut Readings) {
         let Some(gpu) = self.nvml.as_ref().and_then(|n| n.device_by_index(0).ok()) else {
             return;
         };
         r.gpu_load = gpu.utilization_rates().ok().map(|u| u.gpu as f32 / 100.0);
-        r.vram = gpu.memory_info().ok().map(|m| (m.used, m.total));
         r.gpu_power = gpu.power_usage().ok().map(|mw| mw as f32 / 1000.0);
     }
 
