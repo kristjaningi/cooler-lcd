@@ -23,7 +23,8 @@ use crate::theme::Theme;
 
 pub trait Screen {
     /// Refreshes the screen's data. Returns true when the picture changed and
-    /// needs redrawing. Called once per tick while the screen is visible.
+    /// needs redrawing. Called every `interval()` while the screen is
+    /// visible, and right away when it comes up.
     fn update(&mut self, now: DateTime<Local>) -> bool;
 
     /// Draws the whole 480x480 picture.

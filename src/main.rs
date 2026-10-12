@@ -47,8 +47,11 @@ const ALERT_CHECK: Duration = Duration::from_secs(1);
 const REARM: Duration = Duration::from_secs(10 * 60);
 /// Time between frames while the rotation bar is moving, so it glides
 /// rather than jumps on screens that otherwise draw once a second. Cheap,
-/// since moving it re-encodes only the bottom row of the frame.
+/// since moving it re-encodes only the bottom row of the frame. Screens
+/// keep their own pace in between.
 const BAR_TICK: Duration = Duration::from_millis(33);
+/// How often to look for a theme switch.
+const THEME_CHECK: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -110,7 +113,10 @@ fn main() -> Result<()> {
     let mut was_away = false;
     let mut showed_away = false;
     let mut theme_mtime = theme::colors_mtime();
+    let mut theme_checked_at = Instant::now();
     let mut dirty = true;
+    // When the screen on display is next due an update.
+    let mut next_update = Instant::now();
     // The rotation bar's length on the panel, in pixels.
     let mut shown_bar = None;
     loop {
@@ -145,7 +151,12 @@ fn main() -> Result<()> {
 
         // Follow Omarchy theme switches. The theme directory is briefly
         // missing while Omarchy swaps it in, so ignore that state.
-        let mtime = theme::colors_mtime();
+        let mtime = if theme_checked_at.elapsed() >= THEME_CHECK {
+            theme_checked_at = Instant::now();
+            theme::colors_mtime()
+        } else {
+            None
+        };
         if mtime.is_some() && mtime != theme_mtime {
             match Theme::load(true) {
                 Ok(t) => {
@@ -192,10 +203,15 @@ fn main() -> Result<()> {
         } else {
             carousel.current()
         };
-        dirty |= screen.update(Local::now());
-        let interval = match bar {
-            Some(_) => screen.interval().min(BAR_TICK),
-            None => screen.interval(),
+        // Each screen updates at its own pace (and right away after a
+        // switch or a theme change); the bar moves in between.
+        if dirty || tick >= next_update {
+            dirty |= screen.update(Local::now());
+            next_update = tick + screen.interval();
+        }
+        let wake = match bar {
+            Some(_) => next_update.min(tick + BAR_TICK),
+            None => next_update,
         };
 
         // On a render error the sender keeps showing the previous frame;
@@ -218,7 +234,7 @@ fn main() -> Result<()> {
             }
         }
 
-        sleep(interval.saturating_sub(tick.elapsed()));
+        sleep(wake.saturating_duration_since(Instant::now()));
     }
 }
 
