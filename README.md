@@ -58,7 +58,8 @@ is NVIDIA's NVML library, loaded for the GPU temperature).
   (`src/screens/sensors.rs`).
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
-  sans (`src/theme.rs`).
+  sans (`src/theme.rs`). Both are reloaded when `colors.toml` or
+  `~/.config/fontconfig/fonts.conf` changes.
 - **Plan usage:** read from the records Omarchy's Agents bar widget
   (`omarchy.agents`) writes to `~/.local/state/omarchy/agents/usage/`, one
   JSON file per agent, re-read whenever one changes. No network and no

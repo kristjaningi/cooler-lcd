@@ -29,8 +29,18 @@ pub fn colors_path() -> PathBuf {
     PathBuf::from(home).join(".local/state/omarchy/current/theme/colors.toml")
 }
 
-pub fn colors_mtime() -> Option<SystemTime> {
-    fs::metadata(colors_path()).and_then(|m| m.modified()).ok()
+/// When the theme's colors and the user's font config last changed: a
+/// new value means the theme needs loading again. None while the colors
+/// are missing, which they briefly are while Omarchy swaps a theme in.
+/// Omarchy's font setter rewrites only the font config, and it may not
+/// exist at all.
+pub fn stamp() -> Option<(SystemTime, Option<SystemTime>)> {
+    let mtime = |p: PathBuf| fs::metadata(p).and_then(|m| m.modified()).ok();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    Some((
+        mtime(colors_path())?,
+        mtime(home.join(".config/fontconfig/fonts.conf")),
+    ))
 }
 
 impl Theme {

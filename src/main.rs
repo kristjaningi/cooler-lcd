@@ -112,7 +112,7 @@ fn main() -> Result<()> {
     let mut away_screen = screens::away();
     let mut was_away = false;
     let mut showed_away = false;
-    let mut theme_mtime = theme::colors_mtime();
+    let mut theme_stamp = theme::stamp();
     let mut theme_checked_at = Instant::now();
     let mut dirty = true;
     // When the screen on display is next due an update.
@@ -149,19 +149,19 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Follow Omarchy theme switches. The theme directory is briefly
-        // missing while Omarchy swaps it in, so ignore that state.
-        let mtime = if theme_checked_at.elapsed() >= THEME_CHECK {
+        // Follow Omarchy theme and font switches. The theme directory is
+        // briefly missing while Omarchy swaps it in, so ignore that state.
+        let stamp = if theme_checked_at.elapsed() >= THEME_CHECK {
             theme_checked_at = Instant::now();
-            theme::colors_mtime()
+            theme::stamp()
         } else {
             None
         };
-        if mtime.is_some() && mtime != theme_mtime {
+        if stamp.is_some() && stamp != theme_stamp {
             match Theme::load(true) {
                 Ok(t) => {
                     theme = t;
-                    theme_mtime = mtime;
+                    theme_stamp = stamp;
                     dirty = true;
                 }
                 Err(e) => log.error(format!("reloading theme: {e:#}")),
