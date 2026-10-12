@@ -9,6 +9,7 @@ ab_glyph = "0.2"
 anyhow = "1"
 chrono = "0.4"
 jpeg-encoder = { version = "0.7", features = ["simd"] }
+libc = "0.2"
 nusb = "0.2"
 nvml-wrapper = "0.13"
 serde = { version = "1", features = ["derive"] }

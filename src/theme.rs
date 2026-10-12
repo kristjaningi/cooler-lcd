@@ -2,10 +2,12 @@
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use ab_glyph::FontVec;
 use anyhow::{Context, Result, bail};
@@ -135,30 +137,35 @@ fn fc_match(pattern: &str) -> Option<String> {
     run(Command::new("fc-match").args(["-f", "%{file}", pattern]))
 }
 
-/// Runs `command` and returns its trimmed output, if it has any and the
-/// command finishes within `LOOKUP_TIMEOUT`. The output is a line, well
-/// within a pipe's buffer, so it can wait for the exit before reading.
+/// Runs `command` and returns its trimmed output, if it has any and all of
+/// it arrives within `LOOKUP_TIMEOUT`. The command runs in a process group
+/// of its own, which is killed afterwards, so nothing it started outlives
+/// it, or holds its output open past the deadline.
 fn run(command: &mut Command) -> Option<String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + LOOKUP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    let mut stdout = child.stdout.take()?;
+    // The output is whole once every process holding the pipe has let go
+    // of it: the command, and anything it started.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out = String::new();
+        let _ = tx.send(stdout.read_to_string(&mut out).ok().map(|_| out));
+    });
+    let out = rx.recv_timeout(LOOKUP_TIMEOUT).ok().flatten();
+    // The group bears the command's id, which can't be reused until the
+    // command is reaped by the wait below.
+    // SAFETY: kill(2) only sends a signal; a negative id names a group.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let _ = child.wait();
+    let out = out?;
     let out = out.trim();
     (!out.is_empty()).then(|| out.to_string())
 }
@@ -167,6 +174,8 @@ fn run(command: &mut Command) -> Option<String> {
 mod tests {
     use super::*;
 
+    use std::time::Instant;
+
     #[test]
     fn runs_lookups_with_a_deadline() {
         assert_eq!(run(Command::new("echo").arg(" hi ")).as_deref(), Some("hi"));
@@ -174,6 +183,30 @@ mod tests {
         let started = Instant::now();
         assert_eq!(run(Command::new("sleep").arg("10")), None);
         assert!(started.elapsed() < LOOKUP_TIMEOUT + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_lingering_child_neither_holds_up_the_lookup_nor_outlives_it() {
+        let pid_file = std::env::temp_dir().join(format!("cooler-lcd-run-{}", std::process::id()));
+        // Exits at once, but leaves a child holding its output open.
+        let script = format!("sleep 30 & echo $! > {}; printf hi", pid_file.display());
+        let started = Instant::now();
+        run(Command::new("sh").args(["-c", &script]));
+        assert!(started.elapsed() < LOOKUP_TIMEOUT + Duration::from_secs(1));
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let proc = PathBuf::from(format!("/proc/{}", pid.trim()));
+        // Killed; reparented and reaped shortly after.
+        let gone = (0..100).any(|_| {
+            let state = fs::read_to_string(proc.join("stat")).unwrap_or_default();
+            let gone = state.is_empty() || state.contains(") Z ");
+            if !gone {
+                thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(gone, "the child outlived the lookup");
     }
 
     #[test]

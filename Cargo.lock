@@ -124,6 +124,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "jpeg-encoder",
+ "libc",
  "nusb",
  "nvml-wrapper",
  "serde",
