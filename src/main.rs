@@ -207,6 +207,9 @@ fn main() -> Result<()> {
         // carousel, whose screens then stop updating (and fetching).
         let away = desktop.away();
         if away != was_away {
+            if !away {
+                carousel.resume();
+            }
             log.info(
                 if away {
                     "desktop away; dimming"
@@ -490,6 +493,13 @@ impl Carousel {
         Ok(format!("{name} off"))
     }
 
+    /// Gives the screen on display a fresh turn, after the desktop was away
+    /// (when the carousel stands still), so it isn't swapped out the moment
+    /// someone's back.
+    fn resume(&mut self) {
+        self.shown_at = Instant::now();
+    }
+
     /// Takes down a flash whose time is up. Returns true if it did.
     fn expire_flash(&mut self) -> bool {
         if self
@@ -585,6 +595,17 @@ mod tests {
         assert!(parse("--screen").is_err());
         assert!(parse("--scren usage").is_err());
         assert!(parse("help").is_err(), "not a verb, so not run");
+    }
+
+    #[test]
+    fn coming_back_gets_a_fresh_turn() {
+        let (mut c, _) = carousel(2);
+        // Away for longer than a turn.
+        c.shown_at -= c.rotate * 3;
+        c.resume();
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 0);
+        assert!(c.progress().unwrap() < 0.1, "the bar starts over");
     }
 
     #[test]
