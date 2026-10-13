@@ -9,6 +9,8 @@
 //!   cooler-lcd flash TEXT    show a message for one rotation
 //!   cooler-lcd snapshot FILE save what the panel shows as a JPEG
 //!   cooler-lcd timer 25m     count down on the panel; `timer stop` cancels
+//!   cooler-lcd night on      dim the panel now; `off` keeps it bright, `auto`
+//!                            goes by the schedule, and no argument says how it is
 //!
 //! One command per connection, one line each way: the command, then `ok`
 //! (with a message for the user after a space, if there is one) or
@@ -27,10 +29,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::log::Log;
+use crate::night::Mode;
 
 /// Verbs accepted on the command line and the socket.
 pub const VERBS: &[&str] = &[
-    "next", "show", "on", "off", "toggle", "flash", "snapshot", "timer",
+    "next", "show", "on", "off", "toggle", "flash", "snapshot", "timer", "night",
 ];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -61,6 +64,8 @@ pub enum Command {
     Timer(Duration),
     /// Cancels the timer, or dismisses it once it's up.
     TimerStop,
+    /// Overrides night mode, or with none, asks how it stands.
+    Night(Option<Mode>),
 }
 
 /// A command from the socket, with where to send its outcome. Once
@@ -243,9 +248,14 @@ fn parse(line: &str) -> Result<Command, String> {
         ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
         ("timer", "stop") => Ok(Command::TimerStop),
         ("timer", length) if !length.is_empty() => parse_length(length).map(Command::Timer),
+        ("night", "") => Ok(Command::Night(None)),
+        ("night", "on") => Ok(Command::Night(Some(Mode::On))),
+        ("night", "off") => Ok(Command::Night(Some(Mode::Off))),
+        ("night", "auto") => Ok(Command::Night(Some(Mode::Auto))),
         _ => Err(format!(
             "expected one of: next, show NAME, on NAME, off NAME, toggle NAME, \
-             flash TEXT, snapshot /ABSOLUTE/PATH, timer LENGTH, timer stop (got {line:?})"
+             flash TEXT, snapshot /ABSOLUTE/PATH, timer LENGTH, timer stop, \
+             night [on|off|auto] (got {line:?})"
         )),
     }
 }
@@ -345,6 +355,20 @@ mod tests {
         assert!(matches!(parse("timer stop"), Ok(Command::TimerStop)));
         assert!(matches!(parse("timer 25m"), Ok(Command::Timer(d)) if d.as_secs() == 1500));
         assert!(parse("timer").is_err());
+        assert!(matches!(parse("night"), Ok(Command::Night(None))));
+        assert!(matches!(
+            parse("night on"),
+            Ok(Command::Night(Some(Mode::On)))
+        ));
+        assert!(matches!(
+            parse("night  off "),
+            Ok(Command::Night(Some(Mode::Off)))
+        ));
+        assert!(matches!(
+            parse("night auto"),
+            Ok(Command::Night(Some(Mode::Auto)))
+        ));
+        assert!(parse("night dim").is_err());
         assert!(parse("next please").is_err());
         assert!(parse("reboot").is_err());
     }

@@ -11,9 +11,11 @@ mod desktop;
 mod device;
 mod draw;
 mod log;
+mod night;
 mod render;
 mod screens;
 mod sender;
+mod sun;
 mod theme;
 
 use std::collections::{HashMap, VecDeque};
@@ -28,6 +30,7 @@ use control::{Command, Request};
 use desktop::Desktop;
 use device::HEADER_LEN;
 use log::Log;
+use night::Night;
 use render::Renderer;
 use screens::Screen;
 use sender::Sender;
@@ -54,10 +57,12 @@ const USAGE: &str = "\
 usage:
   cooler-lcd [--screen NAME]                    run, cycling through the configured screens
   cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
+                              [--night]         ... dimmed as at night
   cooler-lcd next | show NAME | flash TEXT      steer the running service
   cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation
   cooler-lcd snapshot FILE                      save what the panel shows as a JPEG
-  cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)";
+  cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)
+  cooler-lcd night [on | off | auto]            dim the panel, keep it bright, or follow the schedule";
 
 /// The command line, past the program name, when it isn't a verb.
 #[derive(Debug, Default, PartialEq)]
@@ -66,6 +71,8 @@ struct Args {
     screen: Option<String>,
     /// Where to write a preview frame, if that's what's asked for.
     preview: Option<String>,
+    /// Whether the preview is dimmed as at night.
+    night: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -82,6 +89,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                 let file = args.next_if(|f| !f.starts_with('-'));
                 out.preview = Some(file.map_or("preview.jpg".into(), String::clone));
             }
+            "--night" => out.night = true,
             other => bail!("unknown argument {other:?}\n{USAGE}"),
         }
     }
@@ -106,6 +114,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args = parse_args(&args[1..])?;
+    if args.night && args.preview.is_none() {
+        bail!("--night is for --preview; `cooler-lcd night on` dims the running service");
+    }
     if args.help {
         println!("{USAGE}");
         return Ok(());
@@ -136,6 +147,9 @@ fn main() -> Result<()> {
             sleep(Duration::from_millis(100));
             screen.update(Local::now());
         }
+        if args.night {
+            renderer.set_night(Some(config.night.brightness));
+        }
         renderer.render(screen.as_ref(), &theme)?;
         std::fs::write(&path, &renderer.frame()[HEADER_LEN..])?;
         println!("wrote {path}");
@@ -157,6 +171,8 @@ fn main() -> Result<()> {
     let mut showed_away = false;
     let mut theme_stamp = theme::stamp();
     let mut theme_checked_at = Instant::now();
+    let mut night = Night::new(&config);
+    let mut was_dark = false;
     let mut dirty = true;
     // When the screen on display is next due an update.
     let mut next_update = Instant::now();
@@ -177,6 +193,7 @@ fn main() -> Result<()> {
             }
             let outcome = match command {
                 Command::Snapshot(path) => snapshot(renderer.frame(), &path),
+                Command::Night(mode) => Ok(night.command(mode, Local::now())),
                 // Dismissing a timer that's up works even while away.
                 Command::Next if carousel.timer_up() => carousel.command(Command::Next),
                 // While a timer runs, the carousel says how to stop it.
@@ -247,6 +264,21 @@ fn main() -> Result<()> {
             showed_away = show_away;
             dirty = true;
         }
+        // At night every frame is dimmed, except the away clock's, which
+        // is dim already and would all but vanish.
+        let dark = night.dark(Local::now());
+        if dark != was_dark {
+            log.info(
+                if dark {
+                    "night: dimming"
+                } else {
+                    "night: back to day"
+                }
+                .into(),
+            );
+            was_dark = dark;
+        }
+        dirty |= renderer.set_night((dark && !show_away).then_some(config.night.brightness));
         let rotation = carousel.progress().filter(|_| config.rotate_bar);
         let screen = if show_away {
             &mut away_screen
@@ -488,6 +520,7 @@ impl Carousel {
             }
             Command::Flash(text) => self.flash = Some((screens::flash(text), None)),
             Command::Snapshot(_) => return Err("snapshots are taken by the frame loop".into()),
+            Command::Night(_) => return Err("night mode is the frame loop's".into()),
             Command::Timer(length) => {
                 let ends = Local::now() + TimeDelta::from_std(length).map_err(|e| e.to_string())?;
                 self.timer = Some((screens::timer(length, ends), ends));
@@ -704,6 +737,8 @@ mod tests {
         assert!(parse("--screen").is_err());
         assert!(parse("--scren usage").is_err());
         assert!(parse("help").is_err(), "not a verb, so not run");
+        assert!(parse("--screen radar --preview --night").unwrap().night);
+        assert!(parse("--preview out.jpg --night").unwrap().night);
     }
 
     #[test]

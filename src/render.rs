@@ -7,6 +7,10 @@
 //! restart marker after each row of JPEG blocks, which makes each row's
 //! data stand on its own, so `move_bar` re-encodes only the bottom row (the
 //! bar's) and splices it in place of the old one.
+//!
+//! At night the picture goes out through a tone curve that darkens every
+//! color, the darker ones most (see `night_curve`). The screen's own
+//! picture is left as drawn, so the bar can still be moved on top of it.
 
 use anyhow::{Result, ensure};
 use jpeg_encoder::{ColorType, Encoder};
@@ -23,6 +27,10 @@ pub const SIZE: u32 = 480;
 /// which is 8 pixels tall at the least.
 const BAR_H: f32 = 6.0;
 const _: () = assert!(BAR_H <= 8.0);
+/// How much faster than the brightest colors the darker ones fade at
+/// night: a theme's background sinks nearly to black, where most of the
+/// glow comes from, while text keeps its contrast with it.
+const NIGHT_GAMMA: f32 = 1.2;
 
 pub struct Renderer {
     /// The screen's picture as it last drew it.
@@ -37,6 +45,8 @@ pub struct Renderer {
     /// Where the bottom row's data starts in `frame`, just past the last
     /// restart marker; none until a full encode with this layout.
     tail_at: Option<usize>,
+    /// At night, the brightness it's dimmed to and the curve doing it.
+    night: Option<(f32, [u8; 256])>,
 }
 
 impl Renderer {
@@ -49,7 +59,22 @@ impl Renderer {
             quality: 90,
             frame: Vec::with_capacity(128 * 1024),
             tail_at: None,
+            night: None,
         }
+    }
+
+    /// Dims frames from now on to `brightness` (see `night_curve`), or
+    /// stops dimming them. Returns true on a change, which the frame on
+    /// the panel doesn't show until the next `encode`.
+    pub fn set_night(&mut self, brightness: Option<f32>) -> bool {
+        if self.night.map(|(b, _)| b) == brightness {
+            return false;
+        }
+        self.night = brightness.map(|b| (b, night_curve(b)));
+        // A strip spliced in now would be dimmed differently from the
+        // rest of the frame.
+        self.tail_at = None;
+        true
     }
 
     /// Draws `screen`, to be encoded by the next `encode`.
@@ -61,13 +86,17 @@ impl Renderer {
     /// Encodes the whole of the last drawing, with a rotation bar `bar`
     /// pixels long along the bottom edge when there is one.
     pub fn encode(&mut self, theme: &Theme, bar: Option<u32>) -> Result<()> {
-        let picture = match bar {
-            Some(width) => {
-                self.canvas.data_mut().copy_from_slice(self.scene.data());
+        let picture = if bar.is_some() || self.night.is_some() {
+            self.canvas.data_mut().copy_from_slice(self.scene.data());
+            if let Some(width) = bar {
                 draw_bar(&mut self.canvas, theme, width, 0.0);
-                &self.canvas
             }
-            None => &self.scene,
+            if let Some((_, curve)) = &self.night {
+                dim(&mut self.canvas, curve);
+            }
+            &self.canvas
+        } else {
+            &self.scene
         };
         self.tail_at = None;
         self.frame.clear();
@@ -101,6 +130,9 @@ impl Renderer {
         if let Some(width) = bar {
             draw_bar(&mut self.strip, theme, width, (SIZE - row_h) as f32);
         }
+        if let Some((_, curve)) = &self.night {
+            dim(&mut self.strip, curve);
+        }
         self.strip_jpeg.clear();
         Encoder::new(&mut self.strip_jpeg, self.quality).encode(
             self.strip.data(),
@@ -126,6 +158,24 @@ impl Renderer {
     /// The last encoded frame (header + JPEG); empty before the first render.
     pub fn frame(&self) -> &[u8] {
         &self.frame
+    }
+}
+
+/// The tone curve for night: each channel scaled to `brightness` at its
+/// brightest, and darker values down by more, along a `NIGHT_GAMMA` curve.
+fn night_curve(brightness: f32) -> [u8; 256] {
+    std::array::from_fn(|i| {
+        (255.0 * brightness * (i as f32 / 255.0).powf(NIGHT_GAMMA)).round() as u8
+    })
+}
+
+/// Passes the color of every pixel in `px` through `curve`; the alpha,
+/// always opaque, stays as it is.
+fn dim(px: &mut Pixmap, curve: &[u8; 256]) {
+    for [r, g, b, _] in px.data_mut().as_chunks_mut::<4>().0 {
+        for c in [r, g, b] {
+            *c = curve[*c as usize];
+        }
     }
 }
 
@@ -176,6 +226,7 @@ fn draw_bar(px: &mut Pixmap, theme: &Theme, width: u32, top: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Rgb;
 
     fn theme() -> Theme {
         Theme::fallback()
@@ -203,6 +254,107 @@ mod tests {
                 let spliced = r.frame.clone();
                 r.encode(&theme, bar).unwrap();
                 assert!(spliced == r.frame, "quality {quality}, bar {bar:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn moving_the_bar_at_night_matches_a_full_encode() {
+        let theme = theme();
+        for quality in [90, 75] {
+            let mut r = Renderer::new();
+            r.scene = scene();
+            r.quality = quality;
+            r.encode(&theme, Some(10)).unwrap();
+            assert!(r.set_night(Some(0.6)));
+            assert!(!r.set_night(Some(0.6)), "no change");
+            for bar in [Some(200), None, Some(480)] {
+                r.move_bar(&theme, bar).unwrap();
+                let spliced = r.frame.clone();
+                r.encode(&theme, bar).unwrap();
+                assert!(spliced == r.frame, "quality {quality}, bar {bar:?}");
+            }
+            // Back to day, the first splice redoes the whole frame.
+            r.set_night(None);
+            r.move_bar(&theme, Some(100)).unwrap();
+            let spliced = r.frame.clone();
+            r.encode(&theme, Some(100)).unwrap();
+            assert!(spliced == r.frame, "quality {quality}, by day again");
+        }
+    }
+
+    #[test]
+    fn the_night_curve_darkens_the_dark_most() {
+        let curve = night_curve(0.6);
+        assert_eq!((curve[0], curve[255]), (0, 153));
+        assert!(curve.windows(2).all(|w| w[0] <= w[1]), "never reverses");
+        // The background loses more of its light than the text does.
+        let kept = |c: usize| curve[c] as f32 / c as f32;
+        assert!(kept(0x1a) < kept(0xc0));
+
+        let mut px = Pixmap::new(2, 1).unwrap();
+        px.data_mut()
+            .copy_from_slice(&[255, 0x1a, 0, 255, 0xc0, 0xc0, 0xc0, 255]);
+        dim(&mut px, &curve);
+        let night = [
+            curve[255],
+            curve[0x1a],
+            0,
+            255,
+            curve[0xc0],
+            curve[0xc0],
+            curve[0xc0],
+            255,
+        ];
+        assert_eq!(px.data(), night, "alpha untouched");
+    }
+
+    /// Relative luminance of an sRGB color, 0..=1.
+    fn luminance(c: Rgb) -> f32 {
+        let lin = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+    }
+
+    #[test]
+    fn text_stays_as_readable_at_night() {
+        // Background, muted and foreground of a few Omarchy themes.
+        let themes = [
+            ("tokyo-night", 0x1a1b26, 0x565f89, 0xc0caf5),
+            ("catppuccin", 0x1e1e2e, 0x6c7086, 0xcdd6f4),
+            ("nord", 0x2e3440, 0x667080, 0xd8dee9),
+            ("gruvbox", 0x282828, 0x7c6f64, 0xd4be98),
+            ("everforest", 0x2d353b, 0x4f585e, 0xd3c6aa),
+            ("matte-black", 0x121212, 0x555555, 0xbebebe),
+        ];
+        let rgb = |c: u32| Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+        let curve = night_curve(crate::config::Night::default().brightness);
+        let dimmed = |c: Rgb| {
+            Rgb(
+                curve[c.0 as usize],
+                curve[c.1 as usize],
+                curve[c.2 as usize],
+            )
+        };
+        // Contrast as WCAG has it, with `flare` for the light in the room:
+        // its 5% by day, and at night in the dark only the panel's own
+        // black, about a tenth of that.
+        let contrast = |a: Rgb, b: Rgb, flare: f32| (luminance(a) + flare) / (luminance(b) + flare);
+        for (name, bg, muted, fg) in themes {
+            let (bg, muted, fg) = (rgb(bg), rgb(muted), rgb(fg));
+            for (what, c) in [("muted", muted), ("foreground", fg)] {
+                let day = contrast(c, bg, 0.05);
+                let night = contrast(dimmed(c), dimmed(bg), 0.005);
+                assert!(
+                    night >= day,
+                    "{name} {what}: {night:.2} at night, {day:.2} by day"
+                );
             }
         }
     }

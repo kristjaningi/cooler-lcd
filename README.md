@@ -56,7 +56,8 @@ pauses.
 With more than one screen on, a thin bar along the bottom edge counts down
 to the next. A screen with news (a hot CPU, a nearly spent limit, an
 emergency squawk) takes over the panel, and while the desktop is locked a
-dim clock stands in for them all.
+dim clock stands in for them all. At night the panel dims, so it doesn't
+glow across a dark room.
 
 **Lightweight:** ~0.5% of one core for the still screens, ~2.5% while the
 animated radar is up, and ~35 MB of memory (most of that is NVIDIA's NVML
@@ -102,6 +103,8 @@ cooler-lcd flash "Build finished"      # show a message for one rotation
 cooler-lcd snapshot panel.jpg          # save what the panel shows as a JPEG
 cooler-lcd timer 25m                   # count down on the panel (1h30m, 90s, 25)
 cooler-lcd timer stop                  # cancel it
+cooler-lcd night on                    # dim the panel now (off: keep it bright)
+cooler-lcd night auto                  # back to the schedule; `night` says how it is
 ```
 
 A screen that's off is skipped by the rotation and never takes over the
@@ -119,6 +122,13 @@ minutes and seconds left. The rotation and takeovers wait, and `next` and
 When time's up it counts the time since until `cooler-lcd next` (or
 `timer stop`) dismisses it. It runs on the wall clock, so time spent
 suspended counts.
+
+At night, from 22:00 to 07:00 unless the config says otherwise, every
+screen is drawn darker: backgrounds sink nearly to black, and text, art and
+gauges keep about a third of their light, still readable from your chair.
+`night on` and `night off` hold until the schedule next changes (so a panel
+kept bright one evening dims again the next), or `night auto`. `snapshot`
+saves the panel as it looks, dimmed or not.
 
 While the desktop is away, `next` and `show` are refused, but a flash still
 shows over the dim clock for its rotation, and so does a running timer.
@@ -154,12 +164,20 @@ rotate_bar = true         # the bar counting down to the next screen
 [radar]
 heading = 0               # compass bearing at the top of the scope (0 = north up)
 center = [64.05, -22.25]  # [latitude, longitude] at the middle of the scope
+
+[night]
+schedule = "22:00-07:00"  # when the panel dims: hours, "sunset" or "never"
+brightness = 0.6          # what the brightest colors keep at night, 0.2 to 1
 ```
 
 For `heading`, use the direction you face when you look at the panel. The
 bezel's labels stay true compass bearings and an N marks north. `center`
 can be your home: the config file stays on your machine, and adsb.fi is
 only asked about a spot rounded to 0.1 degrees.
+
+With `schedule = "sunset"` it's dim from sunset to sunrise at the radar's
+`center`, whether or not the radar is on; set that to where you are. Far
+north that's most of a winter's day, so hours are the default.
 
 Restart the service after editing it. A broken config is logged and the
 defaults are used.
@@ -227,6 +245,15 @@ defaults are used.
   a dim clock replaces the screens, which stop updating, so the radar stops
   fetching and plan usage isn't on display. Checked every 2 s over
   Hyprland's IPC socket (`src/desktop.rs`).
+- **Night:** the picture is passed through a tone curve on its way to the
+  encoder: each channel scaled to `brightness` at its brightest and darker
+  values down by more (`out = brightness * in^1.2`), so the background,
+  where most of the glow comes from, sinks further than the text on it.
+  Applying it to the finished picture covers everything a screen draws:
+  album art and the radar's fixed colors as well as the theme's. The away
+  clock is left alone, being dim already. For `"sunset"`, the sun's
+  elevation is worked out every frame from NOAA's formulas
+  (`src/night.rs`, `src/sun.rs`).
 - **Recovery:** a sender thread owns the panel and resends the latest frame
   every second whatever the frame loop is doing (`src/sender.rs`). It
   reconnects when the cooler is unplugged or a write fails, and after
@@ -239,6 +266,7 @@ defaults are used.
 cargo run --release                                          # drive the screen
 cargo run --release -- --preview out.jpg                     # render one frame to a file
 cargo run --release -- --screen dashboard --preview out.jpg  # preview a specific screen
+cargo run --release -- --preview out.jpg --night             # ... as it looks at night
 cargo test                                                   # unit tests
 ```
 
