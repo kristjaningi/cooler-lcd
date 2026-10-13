@@ -24,3 +24,16 @@ heading = 0
 # Reykjavik when unset. Stays on this machine: the feed is only asked
 # about a spot rounded to 0.1 degrees.
 # center = [64.05, -22.25]
+
+[night]
+# When the panel dims, so it doesn't glow across a dark room: hours on the
+# local clock (across midnight if the second comes first), "sunset" (from
+# sunset to sunrise at the radar's center above, which far north is most
+# of a winter's day), or "never". `cooler-lcd night on|off` overrides it
+# until it next changes; `cooler-lcd night auto` hands back to it.
+schedule = "22:00-07:00"
+
+# What the brightest colors keep of their brightness at night, 0.2 to 1.
+# Darker colors sink further, so backgrounds go nearly black while text
+# stays readable.
+brightness = 0.6

@@ -6,7 +6,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::NaiveTime;
 use serde::Deserialize;
+
+/// The radar's center, and where night mode's sun is worked out from,
+/// unless the config sets one: between Keflavik and Reykjavik.
+pub const CENTER: (f32, f32) = (64.05, -22.25);
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -21,6 +26,7 @@ pub struct Config {
     /// Whether a bar along the bottom edge counts down to the next screen.
     pub rotate_bar: bool,
     pub radar: Radar,
+    pub night: Night,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -58,6 +64,80 @@ fn center<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[f32; 2]>, D:
     Ok(Some([lat, lon]))
 }
 
+impl Radar {
+    /// Latitude and longitude at the middle of the scope.
+    pub fn center(&self) -> (f32, f32) {
+        self.center.map_or(CENTER, |[lat, lon]| (lat, lon))
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Night {
+    /// When the panel dims on its own.
+    #[serde(deserialize_with = "schedule")]
+    pub schedule: Schedule,
+    /// What the brightest colors keep of their brightness at night.
+    #[serde(deserialize_with = "brightness")]
+    pub brightness: f32,
+}
+
+impl Default for Night {
+    fn default() -> Self {
+        Self {
+            schedule: Schedule::Hours(
+                NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+                NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
+            ),
+            brightness: 0.6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Schedule {
+    /// From sunset to sunrise at the radar's center.
+    Sunset,
+    /// From the first time of day to the second, on the local clock,
+    /// across midnight if the second comes first.
+    Hours(NaiveTime, NaiveTime),
+    /// Only when `cooler-lcd night on` says so.
+    Never,
+}
+
+fn schedule<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Schedule, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_schedule(&s).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "night schedule is \"sunset\", hours like \"22:00-07:00\", or \"never\" (got {s:?})"
+        ))
+    })
+}
+
+fn parse_schedule(s: &str) -> Option<Schedule> {
+    match s.trim() {
+        "sunset" => Some(Schedule::Sunset),
+        "never" => Some(Schedule::Never),
+        hours => {
+            let (from, to) = hours.split_once('-')?;
+            let time = |t: &str| NaiveTime::parse_from_str(t.trim(), "%H:%M").ok();
+            let (from, to) = (time(from)?, time(to)?);
+            (from != to).then_some(Schedule::Hours(from, to))
+        }
+    }
+}
+
+/// A fraction of full brightness: too little and nothing can be read.
+fn brightness<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let b = f32::deserialize(d)?;
+    if !(0.2..=1.0).contains(&b) {
+        return Err(serde::de::Error::custom(
+            "night brightness is a fraction from 0.2 to 1",
+        ));
+    }
+    Ok(b)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -66,6 +146,7 @@ impl Default for Config {
             off: Vec::new(),
             rotate_bar: true,
             radar: Radar::default(),
+            night: Night::default(),
         }
     }
 }
@@ -123,6 +204,56 @@ mod tests {
         let c = Config::parse("off = [\"radar\"]\nrotate_bar = false").unwrap();
         assert_eq!(c.off, ["radar"]);
         assert!(!c.rotate_bar);
+    }
+
+    #[test]
+    fn parses_night() {
+        let night = |s: &str| Config::parse(&format!("[night]\n{s}")).map(|c| c.night);
+        let at = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        assert_eq!(
+            Config::default().night.schedule,
+            Schedule::Hours(at(22, 0), at(7, 0))
+        );
+        assert_eq!(
+            night("schedule = \"sunset\"").unwrap().schedule,
+            Schedule::Sunset
+        );
+        assert_eq!(
+            night("schedule = \"never\"").unwrap().schedule,
+            Schedule::Never
+        );
+        assert_eq!(
+            night("schedule = \" 21:30 - 6:15 \"").unwrap().schedule,
+            Schedule::Hours(at(21, 30), at(6, 15))
+        );
+        let n = night("brightness = 0.4").unwrap();
+        assert_eq!(n.brightness, 0.4);
+        for bad in [
+            "schedule = \"dusk\"",
+            "schedule = \"22:00\"",
+            "schedule = \"22:00-22:00\"",
+            "schedule = \"25:00-07:00\"",
+            "schedule = 22",
+            "brightness = 0.1",
+            "brightness = 1.5",
+            "brightness = nan",
+            "bright = 0.5",
+        ] {
+            assert!(night(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_center_defaults_between_the_airports() {
+        assert_eq!(Config::default().radar.center(), CENTER);
+        let c = Config::parse("[radar]\ncenter = [65.68, -18.09]").unwrap();
+        assert_eq!(c.radar.center(), (65.68, -18.09));
+    }
+
+    #[test]
+    fn the_sample_config_is_the_defaults() {
+        let sample = Config::parse(include_str!("../dist/config.toml")).unwrap();
+        assert_eq!(sample, Config::default());
     }
 
     #[test]

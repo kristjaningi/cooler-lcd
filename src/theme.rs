@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -19,6 +19,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+#[derive(Clone)]
 pub struct Theme {
     pub background: Rgb,
     pub surface: Rgb,
@@ -29,7 +30,11 @@ pub struct Theme {
     pub yellow: Rgb,
     pub red: Rgb,
     pub cyan: Rgb,
-    pub font: FontVec,
+    /// A light theme: dark text on a light background.
+    pub light: bool,
+    /// Shared, so a theme can be copied (to derive the night one) without
+    /// a second copy of the font file.
+    pub font: Arc<FontVec>,
 }
 
 pub fn colors_path() -> PathBuf {
@@ -79,19 +84,97 @@ impl Theme {
                 .and_then(parse_hex)
                 .unwrap_or(fallback)
         };
+        let background = color("background", Rgb(0x1a, 0x1b, 0x26));
+        let foreground = color("bright_foreground", Rgb(0xc0, 0xca, 0xf5));
+        // Omarchy's themes say which they are; failing that, the colors do.
+        let light = match table.get("mode").and_then(|v| v.as_str()) {
+            Some(mode) => mode == "light",
+            None => luma(background) > luma(foreground),
+        };
         Self {
-            background: color("background", Rgb(0x1a, 0x1b, 0x26)),
+            background,
             surface: color("lighter_background", Rgb(0x24, 0x28, 0x3b)),
-            foreground: color("bright_foreground", Rgb(0xc0, 0xca, 0xf5)),
+            foreground,
             muted: color("dark_foreground", Rgb(0x56, 0x5f, 0x89)),
             accent: color("accent", Rgb(0x7a, 0xa2, 0xf7)),
             green: color("green", Rgb(0x9e, 0xce, 0x6a)),
             yellow: color("yellow", Rgb(0xe0, 0xaf, 0x68)),
             red: color("red", Rgb(0xf7, 0x76, 0x8e)),
             cyan: color("cyan", Rgb(0x7d, 0xcf, 0xff)),
-            font,
+            light,
+            font: Arc::new(font),
         }
     }
+
+    /// The theme as drawn at night. Dimming a light theme would leave a
+    /// gray field glowing behind dark text, so it turns dark instead, in
+    /// its own hues: the background, surface, muted and foreground have
+    /// their lightness flipped, which keeps them in order, and the accents
+    /// take the lighter of theirs and its flip, so one meant to stand out
+    /// against white stands out against black, and a mid-tone one stays as
+    /// it is. A dark theme is fine as it is; the renderer does the dimming.
+    pub fn for_night(&self) -> Theme {
+        if !self.light {
+            return self.clone();
+        }
+        let flip = |c| with_lightness(c, |l| 1.0 - l);
+        let light = |c| with_lightness(c, |l| l.max(1.0 - l));
+        Theme {
+            background: flip(self.background),
+            surface: flip(self.surface),
+            foreground: flip(self.foreground),
+            muted: flip(self.muted),
+            accent: light(self.accent),
+            green: light(self.green),
+            yellow: light(self.yellow),
+            red: light(self.red),
+            cyan: light(self.cyan),
+            light: false,
+            font: Arc::clone(&self.font),
+        }
+    }
+}
+
+/// How light `c` looks, 0..=1 (Rec. 709 weights, on the sRGB values).
+pub fn luma(c: Rgb) -> f32 {
+    (0.2126 * c.0 as f32 + 0.7152 * c.1 as f32 + 0.0722 * c.2 as f32) / 255.0
+}
+
+/// `c` with its HSL lightness (0..=1) passed through `f`, its hue and
+/// saturation kept.
+fn with_lightness(c: Rgb, f: impl Fn(f32) -> f32) -> Rgb {
+    let [r, g, b] = [c.0, c.1, c.2].map(|v| v as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    let l2 = f(l).clamp(0.0, 1.0);
+    let d = max - min;
+    let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    if d == 0.0 {
+        let v = byte(l2);
+        return Rgb(v, v, v);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    // Back to RGB at the new lightness.
+    let l = l2;
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = chroma * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = l - chroma / 2.0;
+    Rgb(byte(r + m), byte(g + m), byte(b + m))
 }
 
 fn read_colors() -> Result<toml::Table> {
@@ -207,6 +290,81 @@ mod tests {
             gone
         });
         assert!(gone, "the child outlived the lookup");
+    }
+
+    fn theme(colors: &str) -> Theme {
+        let table = colors.parse().unwrap();
+        Theme::from_table(&table, load_font().unwrap())
+    }
+
+    #[test]
+    fn a_light_theme_turns_dark_at_night() {
+        // Omarchy's White: its accents are near-black grays.
+        let white = theme(
+            "mode = \"light\"\nbackground = \"#ffffff\"\nlighter_background = \"#c0c0c0\"\n\
+             bright_foreground = \"#000000\"\ndark_foreground = \"#c0c0c0\"\nred = \"#2a2a2a\"",
+        );
+        assert!(white.light);
+        let night = white.for_night();
+        assert_eq!(night.background, Rgb(0, 0, 0));
+        assert_eq!(night.foreground, Rgb(255, 255, 255));
+        assert_eq!(
+            night.surface,
+            Rgb(0x3f, 0x3f, 0x3f),
+            "a step off the background"
+        );
+        assert_eq!(night.muted, night.surface, "as alike as by day");
+        assert_eq!(night.red, Rgb(0xd5, 0xd5, 0xd5), "visible on black");
+        assert!(!night.light);
+
+        // Catppuccin Latte, without `mode`: its colors give it away.
+        let latte = theme(
+            "background = \"#eff1f5\"\nlighter_background = \"#dce0e8\"\n\
+             bright_foreground = \"#4c4f69\"\ndark_foreground = \"#9ca0b0\"\naccent = \"#1e66f5\"",
+        );
+        assert!(latte.light);
+        let night = latte.for_night();
+        let l = |c| luma(c);
+        assert!(l(night.background) < 0.1, "{:?}", night.background);
+        assert!(l(night.background) < l(night.surface));
+        assert!(l(night.surface) < l(night.muted));
+        assert!(l(night.muted) < l(night.foreground));
+        assert_eq!(night.accent, latte.accent, "a mid-tone blue, kept");
+    }
+
+    #[test]
+    fn a_dark_theme_is_the_same_at_night() {
+        let tokyo = Theme::fallback();
+        assert!(!tokyo.light);
+        let night = tokyo.for_night();
+        assert_eq!(night.background, tokyo.background);
+        assert_eq!(night.foreground, tokyo.foreground);
+        assert!(
+            !theme("mode = \"dark\"\nbackground = \"#ffffff\"").light,
+            "it says so"
+        );
+    }
+
+    #[test]
+    fn changes_lightness_keeping_the_hue() {
+        let flip = |c| with_lightness(c, |l| 1.0 - l);
+        assert_eq!(flip(Rgb(255, 255, 255)), Rgb(0, 0, 0));
+        assert_eq!(flip(Rgb(0x80, 0, 0)), Rgb(255, 0x7f, 0x7f));
+        let lighter = with_lightness(Rgb(0x1e, 0x66, 0xf5), |l| l.max(1.0 - l));
+        assert_eq!(lighter, Rgb(0x1e, 0x66, 0xf5), "light enough already");
+        // Flipped twice, a color comes out as it went in.
+        for c in [
+            Rgb(0xf5, 0x66, 0x1e),
+            Rgb(0xd2, 0x0f, 0x39),
+            Rgb(0x40, 0xa0, 0x2b),
+        ] {
+            let back = flip(flip(c));
+            let near = |a: u8, b: u8| a.abs_diff(b) <= 1;
+            assert!(
+                near(back.0, c.0) && near(back.1, c.1) && near(back.2, c.2),
+                "{c:?}"
+            );
+        }
     }
 
     #[test]
