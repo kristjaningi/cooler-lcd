@@ -332,6 +332,12 @@ mod tests {
             ("gruvbox", 0x282828, 0x7c6f64, 0xd4be98),
             ("everforest", 0x2d353b, 0x4f585e, 0xd3c6aa),
             ("matte-black", 0x121212, 0x555555, 0xbebebe),
+            // Light ones, which turn dark at night (`Theme::for_night`).
+            ("white", 0xffffff, 0xc0c0c0, 0x000000),
+            ("catppuccin-latte", 0xeff1f5, 0x9ca0b0, 0x4c4f69),
+            ("rose-pine-dawn", 0xfaf4ed, 0x9893a5, 0x575279),
+            ("flexoki-light", 0xfffcf0, 0x878580, 0x100f0f),
+            ("lupine", 0xfafafa, 0x757575, 0x000000),
         ];
         let rgb = |c: u32| Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
         let curve = night_curve(crate::config::Night::default().brightness);
@@ -345,12 +351,23 @@ mod tests {
         // Contrast as WCAG has it, with `flare` for the light in the room:
         // its 5% by day, and at night in the dark only the panel's own
         // black, about a tenth of that.
-        let contrast = |a: Rgb, b: Rgb, flare: f32| (luminance(a) + flare) / (luminance(b) + flare);
+        let contrast = |a: Rgb, b: Rgb, flare: f32| {
+            let (a, b) = (luminance(a) + flare, luminance(b) + flare);
+            a.max(b) / a.min(b)
+        };
         for (name, bg, muted, fg) in themes {
             let (bg, muted, fg) = (rgb(bg), rgb(muted), rgb(fg));
-            for (what, c) in [("muted", muted), ("foreground", fg)] {
+            let mut day_theme = theme();
+            (day_theme.background, day_theme.muted, day_theme.foreground) = (bg, muted, fg);
+            day_theme.light = luminance(bg) > luminance(fg);
+            let night_theme = day_theme.for_night();
+            let at_night = [night_theme.muted, night_theme.foreground];
+            for ((what, c), n) in [("muted", muted), ("foreground", fg)]
+                .into_iter()
+                .zip(at_night)
+            {
                 let day = contrast(c, bg, 0.05);
-                let night = contrast(dimmed(c), dimmed(bg), 0.005);
+                let night = contrast(dimmed(n), dimmed(night_theme.background), 0.005);
                 assert!(
                     night >= day,
                     "{name} {what}: {night:.2} at night, {day:.2} by day"

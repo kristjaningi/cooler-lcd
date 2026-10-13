@@ -133,7 +133,9 @@ fn main() -> Result<()> {
         None => (config.screens.clone(), config.off.clone()),
     };
     let mut carousel = Carousel::new(&names, &off, &config, &mut log)?;
-    let mut theme = Theme::load(false)?;
+    // The theme as loaded, and as drawn: at night a light one turns dark.
+    let mut day_theme = Theme::load(false)?;
+    let mut theme = day_theme.clone();
     let mut renderer = Renderer::new();
 
     if let Some(path) = args.preview {
@@ -148,6 +150,7 @@ fn main() -> Result<()> {
             screen.update(Local::now());
         }
         if args.night {
+            theme = day_theme.for_night();
             renderer.set_night(Some(config.night.brightness));
         }
         renderer.render(screen.as_ref(), &theme)?;
@@ -224,7 +227,8 @@ fn main() -> Result<()> {
         if stamp.is_some() && stamp != theme_stamp {
             match Theme::load(true) {
                 Ok(t) => {
-                    theme = t;
+                    theme = if was_dark { t.for_night() } else { t.clone() };
+                    day_theme = t;
                     theme_stamp = stamp;
                     dirty = true;
                 }
@@ -277,6 +281,12 @@ fn main() -> Result<()> {
                 .into(),
             );
             was_dark = dark;
+            theme = if dark {
+                day_theme.for_night()
+            } else {
+                day_theme.clone()
+            };
+            dirty = true;
         }
         dirty |= renderer.set_night((dark && !show_away).then_some(config.night.brightness));
         let rotation = carousel.progress().filter(|_| config.rotate_bar);
