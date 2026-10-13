@@ -102,6 +102,10 @@ panel (the radar doesn't fetch traffic either), but `show` still brings it
 up for one turn. It starts off again when the service restarts if the
 config lists it under `off`.
 
+<p align="center">
+  <img src="docs/timer.jpg" width="280" alt="A timer: a ring two thirds of the way round, 1:14 left in the middle, until 00:26 under it">
+</p>
+
 A timer holds the panel while it runs: a huge ring running down around the
 minutes and seconds left. The rotation and takeovers wait, and `next` and
 `show` are refused, though a flash still shows over it for its rotation.
