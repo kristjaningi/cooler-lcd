@@ -6,7 +6,7 @@ use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
 
 use super::Screen;
-use crate::draw::{fill, rounded_rect, text, text_width};
+use crate::draw::{fill, rounded_rect, text, wrap};
 use crate::render::SIZE;
 use crate::theme::Theme;
 
@@ -54,50 +54,16 @@ impl Screen for Flash {
 /// and its lines; the smallest size cuts it off with an ellipsis.
 fn fit(font: &FontVec, message: &str) -> (f32, Vec<String>) {
     for size in SIZES {
-        let lines = wrap(font, message, size);
+        let lines = wrap(font, message, size, WIDTH);
         if lines.len() <= MAX_LINES {
             return (size, lines);
         }
     }
     let size = SIZES[SIZES.len() - 1];
-    let mut lines = wrap(font, message, size);
+    let mut lines = wrap(font, message, size, WIDTH);
     lines.truncate(MAX_LINES);
     if let Some(last) = lines.last_mut() {
         last.push('…');
     }
     (size, lines)
-}
-
-/// Splits `message` into lines no wider than `WIDTH`, breaking between
-/// words (and inside a word too long for a line of its own).
-fn wrap(font: &FontVec, message: &str, size: f32) -> Vec<String> {
-    let fits = |s: &str| text_width(font, s, size) <= WIDTH;
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in message.split_whitespace() {
-        let candidate = if line.is_empty() {
-            word.to_string()
-        } else {
-            format!("{line} {word}")
-        };
-        if fits(&candidate) {
-            line = candidate;
-            continue;
-        }
-        if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
-        }
-        for ch in word.chars() {
-            line.push(ch);
-            if !fits(&line) && line.chars().count() > 1 {
-                line.pop();
-                lines.push(std::mem::take(&mut line));
-                line.push(ch);
-            }
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
 }

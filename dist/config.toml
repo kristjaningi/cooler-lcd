@@ -1,7 +1,8 @@
 # cooler-lcd config. Copy to ~/.config/cooler-lcd/config.toml.
 # Every setting is optional; these are the defaults.
 
-# Screens to show, in order. Available: dashboard, usage, radar
+# Screens to show, in order. Available: dashboard, usage, radar, music
+# (music is skipped while nothing is playing)
 screens = ["dashboard"]
 
 # Screens from the list above that start switched off: skipped by the

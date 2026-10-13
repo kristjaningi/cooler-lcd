@@ -262,6 +262,56 @@ pub fn text_width(font: &FontVec, s: &str, size: f32) -> f32 {
     layout(font, s, size).1
 }
 
+/// Splits `message` into lines no wider than `width` at `size`, breaking between
+/// words (and inside a word too long for a line of its own).
+pub fn wrap(font: &FontVec, message: &str, size: f32, width: f32) -> Vec<String> {
+    let fits = |s: &str| text_width(font, s, size) <= width;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in message.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if fits(&candidate) {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        for ch in word.chars() {
+            line.push(ch);
+            if !fits(&line) && line.chars().count() > 1 {
+                line.pop();
+                lines.push(std::mem::take(&mut line));
+                line.push(ch);
+            }
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// `s` cut short with an ellipsis where it would run past `width` at
+/// `size`; as it is if it fits.
+pub fn ellipsize(font: &FontVec, s: &str, size: f32, width: f32) -> String {
+    if text_width(font, s, size) <= width {
+        return s.to_string();
+    }
+    let mut out: String = s.to_string();
+    while out.pop().is_some() {
+        let cut = format!("{}…", out.trim_end());
+        if text_width(font, &cut, size) <= width {
+            return cut;
+        }
+    }
+    "…".into()
+}
+
 /// Each glyph's pen position relative to the start of the line, and the
 /// line's total advance.
 fn layout(font: &FontVec, s: &str, size: f32) -> (Vec<(GlyphId, f32)>, f32) {

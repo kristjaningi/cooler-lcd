@@ -9,6 +9,7 @@
 mod away;
 mod dashboard;
 mod flash;
+mod music;
 mod radar;
 mod sensors;
 mod timer;
@@ -56,6 +57,21 @@ pub trait Screen {
         Vec::new()
     }
 
+    /// Whether the screen has anything to show. One that doesn't is
+    /// skipped by the rotation (though `show` still brings it up), and
+    /// doesn't take over. Asked on every frame, so keep it cheap.
+    fn present(&self) -> bool {
+        true
+    }
+
+    /// The screen's own progress, 0..=1, for the bar along the bottom
+    /// edge to show in place of the countdown to the next screen. Asked on
+    /// every frame while the screen is up, between updates too, so the
+    /// bar can move without a redraw.
+    fn bar(&self) -> Option<f32> {
+        None
+    }
+
     /// True while the first data is still on its way, so `--preview` can
     /// wait for it instead of capturing an empty screen.
     fn loading(&self) -> bool {
@@ -64,12 +80,13 @@ pub trait Screen {
 }
 
 /// Names accepted in the config's `screens` list.
-pub const NAMES: &[&str] = &["dashboard", "usage", "radar"];
+pub const NAMES: &[&str] = &["dashboard", "usage", "radar", "music"];
 
 pub fn build(name: &str, config: &Config) -> Option<Box<dyn Screen>> {
     match name {
         "dashboard" => Some(Box::new(dashboard::Dashboard::new())),
         "usage" => Some(Box::new(usage::Usage::new())),
+        "music" => Some(Box::new(music::Music::new())),
         "radar" => Some(Box::new(radar::Radar::new(
             config
                 .radar

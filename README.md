@@ -46,6 +46,13 @@ vector and data block (callsign, altitude in hundreds of feet,
 climb/descent, ground speed). The map can be turned to face the way the
 panel does, so traffic on the screen's right is off to your right.
 
+**`music`**: what's playing in Spotify, a browser, VLC or mpv (with
+`mpv-mpris`): the album art across the whole screen, the title and artist
+over its shaded bottom, and how far through the track it is in the bar
+along the bottom edge (even with `rotate_bar = false`). It's in the
+rotation only while something plays, and for half a minute after it
+pauses.
+
 With more than one screen on, a thin bar along the bottom edge counts down
 to the next. A screen with news (a hot CPU, a nearly spent limit, an
 emergency squawk) takes over the panel, and while the desktop is locked a
@@ -139,7 +146,7 @@ waiting for input), add a `Notification` hook to `~/.claude/settings.json`:
 Optional, at `~/.config/cooler-lcd/config.toml` (see `dist/config.toml`):
 
 ```toml
-screens = ["dashboard", "usage", "radar"]   # shown in order
+screens = ["dashboard", "usage", "radar", "music"]   # shown in order
 off = ["radar"]           # configured, but out of the rotation until `cooler-lcd on`
 rotate_seconds = 15       # time per screen when more than one is listed
 rotate_bar = true         # the bar counting down to the next screen
@@ -208,6 +215,14 @@ defaults are used.
   between polls, so blips glide at the 15 fps animation rate. The static
   scope, rings and map are drawn once per theme. Coastline from Natural
   Earth, runways from OurAirports (`src/screens/radar/`).
+- **Music:** players are found on the session bus over MPRIS, polled
+  with `busctl` (one call for the list of players, one for each player's
+  state) every 2 s while the screen is up and every 5 s while it isn't,
+  about 0.1% of a core. A playing player wins, then a paused one. The
+  track's position is run on between polls, so the bar keeps moving. Album
+  art is read from wherever the player points (a file, an inline `data:`
+  URL, or the web, capped at 10 MB and 4096 pixels a side), then scaled
+  and shaded once per track (`src/screens/music/`).
 - **Away:** while the Hyprland session is locked or every monitor is off,
   a dim clock replaces the screens, which stop updating, so the radar stops
   fetching and plan usage isn't on display. Checked every 2 s over

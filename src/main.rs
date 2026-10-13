@@ -247,10 +247,7 @@ fn main() -> Result<()> {
             showed_away = show_away;
             dirty = true;
         }
-        let bar = carousel
-            .progress()
-            .filter(|_| config.rotate_bar && !show_away)
-            .map(|p| (p * render::SIZE as f32).round() as u32);
+        let rotation = carousel.progress().filter(|_| config.rotate_bar);
         let screen = if show_away {
             &mut away_screen
         } else {
@@ -262,6 +259,12 @@ fn main() -> Result<()> {
             dirty |= screen.update(Local::now());
             next_update = tick + screen.interval();
         }
+        // A screen's own progress (a track's) takes the place of the
+        // countdown to the next screen.
+        let bar = (!show_away)
+            .then(|| screen.bar().or(rotation))
+            .flatten()
+            .map(|p| (p * render::SIZE as f32).round() as u32);
         let wake = match bar {
             Some(_) => next_update.min(tick + BAR_TICK),
             None => next_update,
@@ -357,7 +360,8 @@ impl Carousel {
             log.error("every screen is off; turning the first one on".into());
             carousel.on[0] = true;
         }
-        carousel.index = carousel.on.iter().position(|&on| on).unwrap_or(0);
+        // The first one on with something to show, counting from the top.
+        carousel.index = carousel.next_on(carousel.screens.len() - 1);
         Ok(carousel)
     }
 
@@ -411,13 +415,15 @@ impl Carousel {
         switched
     }
 
-    /// The first screen in the rotation after `i`, round to `i` itself if
-    /// it's the only one.
+    /// The first screen in the rotation after `i` with something to show,
+    /// round to `i` itself if it's the only one. If none has, the next one
+    /// on, so the panel doesn't stick on a screen that's off.
     fn next_on(&self, i: usize) -> usize {
         let n = self.screens.len();
-        (1..=n)
-            .map(|k| (i + k) % n)
-            .find(|&j| self.on[j])
+        let order = || (1..=n).map(move |k| (i + k) % n);
+        order()
+            .find(|&j| self.on[j] && self.screens[j].1.present())
+            .or_else(|| order().find(|&j| self.on[j]))
             .unwrap_or(i)
     }
 
@@ -442,7 +448,7 @@ impl Carousel {
         let local = Local::now();
         for (i, ((name, screen), seen)) in self.screens.iter_mut().zip(&mut self.seen).enumerate() {
             seen.retain(|_, at| now.duration_since(*at) < REARM);
-            if !self.on[i] {
+            if !self.on[i] || !screen.present() {
                 continue;
             }
             for alert in screen.alerts(local) {
@@ -521,6 +527,10 @@ impl Carousel {
         let now = Instant::now();
         for alert in self.screens[i].1.alerts(Local::now()) {
             self.seen[i].insert(alert, now);
+        }
+        // With nothing to show yet, it waits for its turn once it has.
+        if !self.screens[i].1.present() {
+            return Ok(format!("{name} on, shown once it has something to show"));
         }
         // Not from under a timer; it comes up after.
         if self.timing() {
@@ -614,7 +624,7 @@ impl Carousel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use tiny_skia::Pixmap;
@@ -630,6 +640,28 @@ mod tests {
         fn alerts(&mut self, _now: chrono::DateTime<Local>) -> Vec<String> {
             self.0.borrow().clone()
         }
+    }
+
+    /// A screen with something to show only while the test says so.
+    struct Sometimes(Rc<Cell<bool>>);
+
+    impl Screen for Sometimes {
+        fn update(&mut self, _now: chrono::DateTime<Local>) -> bool {
+            false
+        }
+        fn draw(&self, _px: &mut Pixmap, _theme: &Theme) {}
+        fn present(&self) -> bool {
+            self.0.get()
+        }
+    }
+
+    /// `carousel(n)` with its screen 1 there only while the returned flag
+    /// is set.
+    fn with_sometimes(n: usize) -> (Carousel, Rc<Cell<bool>>) {
+        let (mut c, _) = carousel(n);
+        let present = Rc::new(Cell::new(false));
+        c.screens[1].1 = Box::new(Sometimes(Rc::clone(&present)));
+        (c, present)
     }
 
     fn carousel(n: usize) -> (Carousel, Vec<Rc<RefCell<Vec<String>>>>) {
@@ -850,5 +882,56 @@ mod tests {
         tick(&mut c);
         assert_eq!(c.index, 1);
         assert!(c.command(Command::On("nope".into())).is_err());
+    }
+
+    #[test]
+    fn a_screen_with_nothing_to_show_is_skipped() {
+        let (mut c, present) = with_sometimes(3);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 2, "skipped s1");
+        present.set(true);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 0);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 1, "in the rotation now");
+        // Gone while up: it keeps its turn, then the rotation passes it by.
+        present.set(false);
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 1);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 2);
+        // `show` still brings it up, and `on` says why it may not stay.
+        c.command(Command::Show("s1".into())).unwrap();
+        assert_eq!(c.index, 1);
+        c.command(Command::Off("s1".into())).unwrap();
+        let on = c.command(Command::On("s1".into())).unwrap();
+        assert!(on.contains("once it has something"), "{on}");
+        assert_eq!(c.index, 2, "not shown with nothing to show");
+        present.set(true);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 0);
+        c.shown_at -= c.rotate;
+        tick(&mut c);
+        assert_eq!(c.index, 1, "back in the rotation");
+    }
+
+    #[test]
+    fn with_nothing_else_to_show_the_rotation_rests() {
+        let (mut c, present) = with_sometimes(2);
+        assert_eq!(c.progress(), None, "s0 is the only screen with anything");
+        c.shown_at -= c.rotate;
+        assert!(!tick(&mut c));
+        assert_eq!(c.index, 0);
+        present.set(true);
+        assert!(c.progress().is_some(), "counting down to s1");
+        // With s0 off, an absent s1 still shows rather than nothing.
+        present.set(false);
+        c.command(Command::Off("s0".into())).unwrap();
+        assert_eq!(c.index, 1);
     }
 }
