@@ -93,6 +93,8 @@ cooler-lcd off radar                   # take it out again
 cooler-lcd toggle radar                # one or the other; prints which
 cooler-lcd flash "Build finished"      # show a message for one rotation
 cooler-lcd snapshot panel.jpg          # save what the panel shows as a JPEG
+cooler-lcd timer 25m                   # count down on the panel (1h30m, 90s, 25)
+cooler-lcd timer stop                  # cancel it
 ```
 
 A screen that's off is skipped by the rotation and never takes over the
@@ -100,8 +102,16 @@ panel (the radar doesn't fetch traffic either), but `show` still brings it
 up for one turn. It starts off again when the service restarts if the
 config lists it under `off`.
 
+A timer holds the panel while it runs: a huge ring running down around the
+minutes and seconds left. The rotation and takeovers wait, and `next` and
+`show` are refused, though a flash still shows over it for its rotation.
+When time's up it counts the time since until `cooler-lcd next` (or
+`timer stop`) dismisses it. It runs on the wall clock, so time spent
+suspended counts.
+
 While the desktop is away, `next` and `show` are refused, but a flash still
-shows over the dim clock for its rotation.
+shows over the dim clock for its rotation, and so does a running timer.
+One that's up waits behind the clock until you're back.
 
 To have the cooler show Claude Code's notifications (permission prompts,
 waiting for input), add a `Notification` hook to `~/.claude/settings.json`:

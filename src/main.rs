@@ -21,7 +21,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use chrono::Local;
+use chrono::{DateTime, Local, TimeDelta};
 
 use config::Config;
 use control::{Command, Request};
@@ -56,7 +56,8 @@ usage:
   cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
   cooler-lcd next | show NAME | flash TEXT      steer the running service
   cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation
-  cooler-lcd snapshot FILE                      save what the panel shows as a JPEG";
+  cooler-lcd snapshot FILE                      save what the panel shows as a JPEG
+  cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)";
 
 /// The command line, past the program name, when it isn't a verb.
 #[derive(Debug, Default, PartialEq)]
@@ -176,7 +177,10 @@ fn main() -> Result<()> {
             }
             let outcome = match command {
                 Command::Snapshot(path) => snapshot(renderer.frame(), &path),
-                Command::Next | Command::Show(_) if desktop.away() => {
+                // Dismissing a timer that's up works even while away.
+                Command::Next if carousel.timer_up() => carousel.command(Command::Next),
+                // While a timer runs, the carousel says how to stop it.
+                Command::Next | Command::Show(_) if desktop.away() && !carousel.timing() => {
                     Err("the desktop is away, so the panel shows the clock".into())
                 }
                 command => carousel.command(command),
@@ -235,7 +239,10 @@ fn main() -> Result<()> {
         } else {
             carousel.advance(&mut log)
         };
-        let show_away = away && !carousel.flashing();
+        // A running timer shows over the dim clock; one that's up waits
+        // behind it, so it doesn't glow all night.
+        let show_away =
+            away && !carousel.flashing() && !(carousel.timing() && !carousel.timer_up());
         if show_away != showed_away {
             showed_away = show_away;
             dirty = true;
@@ -294,13 +301,16 @@ fn snapshot(frame: &[u8], path: &std::path::Path) -> Result<String, String> {
 
 /// The configured screens, shown one at a time for `rotate` each. A screen
 /// with a new alert jumps the queue and stays up for a full `rotate` (several
-/// take their turns), and a flashed message goes in front of them all for as
-/// long.
+/// take their turns). A timer holds the panel until it's stopped or, once
+/// it's up, dismissed, and a flashed message goes in front of them all for
+/// a `rotate`.
 struct Carousel {
     /// A message from `cooler-lcd flash` and when it was first drawn. Its
     /// time runs from then, so one sent while the panel is unplugged still
     /// gets its full turn once it's back.
     flash: Option<(Box<dyn Screen>, Option<Instant>)>,
+    /// A countdown from `cooler-lcd timer` and when it's up.
+    timer: Option<(Box<dyn Screen>, DateTime<Local>)>,
     screens: Vec<(String, Box<dyn Screen>)>,
     /// Which screens are in the rotation; at least one always is. One
     /// that's off is only shown when asked for by name, and doesn't take
@@ -354,6 +364,7 @@ impl Carousel {
     fn with_screens(screens: Vec<(String, Box<dyn Screen>)>, rotate: Duration) -> Self {
         Self {
             flash: None,
+            timer: None,
             seen: vec![HashMap::new(); screens.len()],
             on: vec![true; screens.len()],
             screens,
@@ -372,7 +383,8 @@ impl Carousel {
         if self.flash.is_some() {
             return self.expire_flash();
         }
-        if self.screens.len() < 2 {
+        // The rotation, takeovers included, waits for the timer.
+        if self.screens.len() < 2 || self.timer.is_some() {
             return false;
         }
         self.check_alerts(log);
@@ -410,9 +422,10 @@ impl Carousel {
     }
 
     /// How far the current screen is through its turn, 0..=1, while another
-    /// screen is due after it: not with one screen on, nor during a flash.
+    /// screen is due after it: not with one screen on, nor during a flash
+    /// or a timer.
     fn progress(&self) -> Option<f32> {
-        if self.flash.is_some() || self.next_on(self.index) == self.index {
+        if self.flash.is_some() || self.timer.is_some() || self.next_on(self.index) == self.index {
             return None;
         }
         Some((self.shown_at.elapsed().as_secs_f32() / self.rotate.as_secs_f32()).min(1.0))
@@ -447,9 +460,18 @@ impl Carousel {
     /// for the user, which may be empty.
     fn command(&mut self, command: Command) -> Result<String, String> {
         match command {
+            Command::Next | Command::Show(_) if self.timing() && !self.timer_up() => {
+                return Err("a timer is running; `cooler-lcd timer stop` cancels it".into());
+            }
+            // Dismisses a timer that's up, back to the screen it covered.
+            Command::Next if self.timer.is_some() => self.end_timer(),
             Command::Next => self.switch_to(self.next_on(self.index)),
             // A screen that's off gets one turn, then the rotation goes on.
-            Command::Show(name) => self.switch_to(self.find(&name)?),
+            Command::Show(name) => {
+                let i = self.find(&name)?;
+                self.timer = None;
+                self.switch_to(i);
+            }
             Command::On(name) => return self.turn_on(&name),
             Command::Off(name) => return self.turn_off(&name),
             Command::Toggle(name) => {
@@ -460,6 +482,18 @@ impl Carousel {
             }
             Command::Flash(text) => self.flash = Some((screens::flash(text), None)),
             Command::Snapshot(_) => return Err("snapshots are taken by the frame loop".into()),
+            Command::Timer(length) => {
+                let ends = Local::now() + TimeDelta::from_std(length).map_err(|e| e.to_string())?;
+                self.timer = Some((screens::timer(length, ends), ends));
+                self.flash = None;
+                return Ok(ends.format("until %H:%M").to_string());
+            }
+            Command::TimerStop => {
+                if self.timer.is_none() {
+                    return Err("no timer is running".into());
+                }
+                self.end_timer();
+            }
         }
         Ok(String::new())
     }
@@ -488,7 +522,12 @@ impl Carousel {
         for alert in self.screens[i].1.alerts(Local::now()) {
             self.seen[i].insert(alert, now);
         }
-        self.switch_to(i);
+        // Not from under a timer; it comes up after.
+        if self.timing() {
+            self.index = i;
+        } else {
+            self.switch_to(i);
+        }
         Ok(format!("{name} on"))
     }
 
@@ -515,6 +554,24 @@ impl Carousel {
     /// someone's back.
     fn resume(&mut self) {
         self.shown_at = Instant::now();
+    }
+
+    /// Takes down the timer, giving the screen it covered a fresh turn.
+    fn end_timer(&mut self) {
+        self.timer = None;
+        self.taken_over = false;
+        self.shown_at = Instant::now();
+    }
+
+    fn timing(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    /// Whether there's a timer and its time is up.
+    fn timer_up(&self) -> bool {
+        self.timer
+            .as_ref()
+            .is_some_and(|(_, ends)| Local::now() >= *ends)
     }
 
     /// Takes down a flash whose time is up. Returns true if it did.
@@ -544,7 +601,10 @@ impl Carousel {
     }
 
     fn current(&mut self) -> &mut Box<dyn Screen> {
-        match &mut self.flash {
+        if let Some((screen, _)) = &mut self.flash {
+            return screen;
+        }
+        match &mut self.timer {
             Some((screen, _)) => screen,
             None => &mut self.screens[self.index].1,
         }
@@ -707,6 +767,72 @@ mod tests {
         c.shown_at -= c.rotate;
         tick(&mut c);
         assert_eq!(c.index, 2);
+    }
+
+    #[test]
+    fn a_timer_holds_the_panel_until_dismissed() {
+        let (mut c, alerts) = carousel(2);
+        c.command(Command::Flash("Claude needs you".into()))
+            .unwrap();
+        c.command(Command::Timer(Duration::from_secs(1500)))
+            .unwrap();
+        assert!(c.timing());
+        assert!(!c.flashing(), "the timer was just asked for");
+        assert_eq!(c.progress(), None);
+        // Neither the rotation nor a takeover moves it.
+        c.shown_at -= c.rotate * 3;
+        alerts[1].replace(vec!["CPU over 85°".into()]);
+        assert!(!tick(&mut c));
+        assert!(c.timing());
+        assert!(
+            c.command(Command::Next).is_err(),
+            "running, so `timer stop`"
+        );
+        assert!(c.command(Command::Show("s1".into())).is_err());
+
+        // Once it's up, `next` dismisses it, back to the screen it covered.
+        if let Some((_, ends)) = &mut c.timer {
+            *ends = Local::now();
+        }
+        assert!(c.timer_up());
+        c.command(Command::Next).unwrap();
+        assert!(!c.timing());
+        assert_eq!(c.index, 0);
+        assert!(c.progress().unwrap() < 0.1, "with a fresh turn");
+        // News from while it ran comes next.
+        assert!(tick(&mut c));
+        assert_eq!(c.index, 1);
+    }
+
+    #[test]
+    fn a_timer_can_be_stopped() {
+        let (mut c, _) = carousel(2);
+        assert!(c.command(Command::TimerStop).is_err(), "none running");
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(Command::TimerStop).unwrap();
+        assert!(!c.timing());
+        // `on` puts a screen in the rotation without taking the panel.
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(Command::Off("s1".into())).unwrap();
+        c.command(Command::On("s1".into())).unwrap();
+        assert!(c.timing());
+        assert_eq!(c.index, 1, "up next once the timer's done");
+        c.command(Command::TimerStop).unwrap();
+        // A new timer replaces a running one, and once it's up, `show`
+        // dismisses it too.
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(Command::Timer(Duration::from_secs(120))).unwrap();
+        assert!(c.command(Command::Show("s1".into())).is_err());
+        if let Some((_, ends)) = &mut c.timer {
+            *ends = Local::now();
+        }
+        c.command(Command::Show("s1".into())).unwrap();
+        assert!(!c.timing());
+        assert_eq!(c.index, 1);
+        // A flash still goes over a timer for its turn.
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(Command::Flash("Build finished".into())).unwrap();
+        assert!(c.flashing() && c.timing());
     }
 
     #[test]

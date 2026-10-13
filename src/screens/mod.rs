@@ -11,6 +11,7 @@ mod dashboard;
 mod flash;
 mod radar;
 mod sensors;
+mod timer;
 mod usage;
 
 use std::time::Duration;
@@ -46,7 +47,8 @@ pub trait Screen {
     /// Every condition worth taking over the panel for right now, each as a
     /// short text that stays the same for as long as the condition lasts.
     /// Asked about once a second while the carousel is showing (not while
-    /// away or flashing, and not with a single screen), whether or not this
+    /// away, flashing or timing, and not with a single screen), whether or
+    /// not this
     /// screen is the visible one, so keep it cheap. A condition the carousel
     /// hasn't seen in a while brings this screen to the front for one
     /// rotation; one that lasts, or flickers on and off, doesn't again.
@@ -88,4 +90,9 @@ pub fn away() -> Box<dyn Screen> {
 /// A message from `cooler-lcd flash`.
 pub fn flash(message: String) -> Box<dyn Screen> {
     Box::new(flash::Flash::new(message))
+}
+
+/// A countdown from `cooler-lcd timer`, `length` long and up at `ends`.
+pub fn timer(length: Duration, ends: DateTime<Local>) -> Box<dyn Screen> {
+    Box::new(timer::Timer::new(length, ends))
 }

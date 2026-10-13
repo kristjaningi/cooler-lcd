@@ -8,6 +8,7 @@
 //!   cooler-lcd toggle NAME   one or the other
 //!   cooler-lcd flash TEXT    show a message for one rotation
 //!   cooler-lcd snapshot FILE save what the panel shows as a JPEG
+//!   cooler-lcd timer 25m     count down on the panel; `timer stop` cancels
 //!
 //! One command per connection, one line each way: the command, then `ok`
 //! (with a message for the user after a space, if there is one) or
@@ -28,7 +29,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
-pub const VERBS: &[&str] = &["next", "show", "on", "off", "toggle", "flash", "snapshot"];
+pub const VERBS: &[&str] = &[
+    "next", "show", "on", "off", "toggle", "flash", "snapshot", "timer",
+];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// The whole command has to arrive within this, however it trickles in.
@@ -36,6 +39,8 @@ const READ_DEADLINE: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest command accepted, in bytes.
 const MAX_LINE: usize = 1024;
+/// The longest timer accepted.
+const MAX_TIMER: Duration = Duration::from_secs(24 * 60 * 60);
 /// Connections served at once; more are turned away.
 const MAX_CLIENTS: usize = 8;
 /// Pause after a failed accept (out of file descriptors, say), so the
@@ -52,6 +57,10 @@ pub enum Command {
     /// Where to save the frame on the panel; an absolute path, since the
     /// service doesn't share the client's working directory.
     Snapshot(PathBuf),
+    /// Counts down this long on the panel.
+    Timer(Duration),
+    /// Cancels the timer, or dismisses it once it's up.
+    TimerStop,
 }
 
 /// A command from the socket, with where to send its outcome. Once
@@ -232,11 +241,58 @@ fn parse(line: &str) -> Result<Command, String> {
         ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
         ("flash", text) if !text.is_empty() => Ok(Command::Flash(text.into())),
         ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
+        ("timer", "stop") => Ok(Command::TimerStop),
+        ("timer", length) if !length.is_empty() => parse_length(length).map(Command::Timer),
         _ => Err(format!(
             "expected one of: next, show NAME, on NAME, off NAME, toggle NAME, \
-             flash TEXT, snapshot /ABSOLUTE/PATH (got {line:?})"
+             flash TEXT, snapshot /ABSOLUTE/PATH, timer LENGTH, timer stop (got {line:?})"
         )),
     }
+}
+
+/// A timer's length, like `25m`, `1h30m`, `90s` or a bare `25` for
+/// minutes, from a second up to `MAX_TIMER`.
+fn parse_length(s: &str) -> Result<Duration, String> {
+    let bad = || format!("expected a length like 25m, 1h30m or 90s (got {s:?})");
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let s = if s.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{s}m")
+    } else {
+        s
+    };
+    let mut secs: u64 = 0;
+    let mut number = String::new();
+    let mut units = "hms".chars();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        // Each unit at most once, largest first: 1h30m, not 30m1h.
+        let scale = match units.find(|&u| u == ch) {
+            Some('h') => 3600,
+            Some('m') => 60,
+            Some('s') => 1,
+            _ => return Err(bad()),
+        };
+        let n: u64 = std::mem::take(&mut number).parse().map_err(|_| bad())?;
+        secs = n
+            .checked_mul(scale)
+            .and_then(|n| secs.checked_add(n))
+            .ok_or_else(bad)?;
+    }
+    if !number.is_empty() || secs == 0 {
+        return Err(bad());
+    }
+    let length = Duration::from_secs(secs);
+    if length > MAX_TIMER {
+        return Err(format!("{s} is longer than a day"));
+    }
+    Ok(length)
 }
 
 /// Sends one command line to the running service and returns its message
@@ -286,8 +342,37 @@ mod tests {
         );
         assert!(parse("snapshot out.jpg").is_err(), "relative to what?");
         assert!(parse("flash").is_err());
+        assert!(matches!(parse("timer stop"), Ok(Command::TimerStop)));
+        assert!(matches!(parse("timer 25m"), Ok(Command::Timer(d)) if d.as_secs() == 1500));
+        assert!(parse("timer").is_err());
         assert!(parse("next please").is_err());
         assert!(parse("reboot").is_err());
+    }
+
+    #[test]
+    fn parses_timer_lengths() {
+        let secs = |s| parse_length(s).map(|d| d.as_secs());
+        assert_eq!(secs("25m"), Ok(1500));
+        assert_eq!(secs("25"), Ok(1500), "minutes by default");
+        assert_eq!(secs("90s"), Ok(90));
+        assert_eq!(secs("1h30m"), Ok(5400));
+        assert_eq!(secs("1h 30m"), Ok(5400));
+        assert_eq!(secs("1H30M"), Ok(5400));
+        assert_eq!(secs("24h"), Ok(86400));
+        for bad in [
+            "0",
+            "0m",
+            "m",
+            "25x",
+            "1h1",
+            "30m1h",
+            "5m5m",
+            "25h",
+            "-5m",
+            "99999999999999999999h",
+        ] {
+            assert!(secs(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
