@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -20,6 +20,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+#[derive(Clone)]
 pub struct Theme {
     /// Cache identity, including font reloads even when an allocator reuses
     /// the old font's address while a screen is hidden.
@@ -33,7 +34,9 @@ pub struct Theme {
     pub yellow: Rgb,
     pub red: Rgb,
     pub cyan: Rgb,
-    pub font: FontVec,
+    /// Shared, so a theme can be copied (to derive the night one) without
+    /// a second copy of the font file.
+    pub font: Arc<FontVec>,
 }
 
 pub fn colors_path() -> PathBuf {
@@ -95,7 +98,7 @@ impl Theme {
             yellow: color("yellow", Rgb(0xe0, 0xaf, 0x68)),
             red: color("red", Rgb(0xf7, 0x76, 0x8e)),
             cyan: color("cyan", Rgb(0x7d, 0xcf, 0xff)),
-            font,
+            font: Arc::new(font),
         }
     }
 }
