@@ -7,7 +7,7 @@ use tiny_skia::Pixmap;
 use super::Screen;
 use crate::draw::{fill, mix, text};
 use crate::render::SIZE;
-use crate::theme::{Rgb, Theme};
+use crate::theme::{Rgb, Theme, luma};
 
 const BLACK: Rgb = Rgb(0, 0, 0);
 
@@ -43,7 +43,6 @@ impl Screen for Away {
 /// on a dark theme, its background on a light one), or white if neither is
 /// light, dimmed.
 fn clock_color(foreground: Rgb, background: Rgb) -> Rgb {
-    let luma = |c: Rgb| (0.2126 * c.0 as f32 + 0.7152 * c.1 as f32 + 0.0722 * c.2 as f32) / 255.0;
     let light = if luma(foreground) >= luma(background) {
         foreground
     } else {

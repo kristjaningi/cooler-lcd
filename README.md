@@ -287,7 +287,11 @@ defaults are used.
   where most of the glow comes from, sinks further than the text on it.
   Applying it to the finished picture covers everything a screen draws:
   album art and the radar's fixed colors as well as the theme's. The away
-  clock is left alone, being dim already. For `"sunset"`, the sun's
+  clock is left alone, being dim already. A light theme (`mode = "light"`
+  in its `colors.toml`) would still glow, as a gray field, so at night it
+  turns dark in its own hues first: the background, text and their
+  in-betweens have their lightness flipped, and accents take the lighter
+  of theirs and its flip (`src/theme.rs`). For `"sunset"`, the sun's
   elevation is worked out every frame from NOAA's formulas
   (`src/night.rs`, `src/sun.rs`).
 - **Recovery:** a sender thread owns the panel and resends the latest frame
