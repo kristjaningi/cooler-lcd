@@ -29,8 +29,6 @@ use crate::draw::{Align, mix};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
 
-/// Scope center unless the config sets one: between the two airports.
-pub const CENTER: (f32, f32) = (64.05, -22.25);
 /// Range at the scope's edge, nautical miles.
 const RANGE_NM: f32 = 25.0;
 /// Aircraft are fetched a little beyond the edge so they enter smoothly,
@@ -1015,6 +1013,7 @@ fn dot(px: &mut Pixmap, (x, y): (f32, f32), r: f32, c: Rgb, alpha: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CENTER;
 
     #[test]
     fn projects_around_center() {

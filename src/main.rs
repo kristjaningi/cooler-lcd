@@ -12,10 +12,12 @@ mod desktop;
 mod device;
 mod draw;
 mod log;
+mod night;
 mod picture;
 mod render;
 mod screens;
 mod sender;
+mod sun;
 mod theme;
 
 use std::collections::{HashMap, VecDeque};
@@ -31,6 +33,7 @@ use control::{Command, Request};
 use desktop::Desktop;
 use device::HEADER_LEN;
 use log::Log;
+use night::Night;
 use render::Renderer;
 use screens::Screen;
 use sender::{Receipt, Sender};
@@ -57,12 +60,14 @@ const USAGE: &str = "\
 usage:
   cooler-lcd [--screen NAME]                    run, cycling through the configured screens
   cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
+                               [--night]         ... dimmed as at night
   cooler-lcd next | show NAME                  steer the running service
   cooler-lcd flash TEXT [OPTIONS]              show a message
   cooler-lcd image FILE [OPTIONS]              show an image, scaled/cropped to 480x480
   cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation
   cooler-lcd snapshot FILE                      save what the panel shows as a JPEG
   cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)
+  cooler-lcd night [on | off | auto]            dim the panel, keep it bright, or follow the schedule
 
 content options:
   --for LENGTH       stay for this long (30s, 2m); default: one rotation
@@ -79,6 +84,8 @@ struct Args {
     screen: Option<String>,
     /// Where to write a preview frame, if that's what's asked for.
     preview: Option<String>,
+    /// Whether the preview is dimmed as at night.
+    night: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -95,6 +102,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                 let file = args.next_if(|f| !f.starts_with('-'));
                 out.preview = Some(file.map_or("preview.jpg".into(), String::clone));
             }
+            "--night" => out.night = true,
             other => bail!("unknown argument {other:?}\n{USAGE}"),
         }
     }
@@ -117,6 +125,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args = parse_args(&args[1..])?;
+    if args.night && args.preview.is_none() {
+        bail!("--night is for --preview; `cooler-lcd night on` dims the running service");
+    }
     if args.help {
         println!("{USAGE}");
         return Ok(());
@@ -148,6 +159,9 @@ fn main() -> Result<()> {
             sleep(Duration::from_millis(100));
             screen.update(Local::now());
         }
+        if args.night {
+            renderer.set_night(Some(config.night.brightness));
+        }
         renderer.render(screen.as_ref(), &theme)?;
         std::fs::write(&path, &renderer.frame()[HEADER_LEN..])?;
         println!("wrote {path}");
@@ -169,6 +183,8 @@ fn main() -> Result<()> {
     let mut showed_away = false;
     let mut theme_stamp = theme::stamp();
     let mut theme_checked_at = Instant::now();
+    let mut night = Night::new(&config);
+    let mut was_dark = false;
     let mut dirty = true;
     // When the screen on display is next due an update.
     let mut next_update = Instant::now();
@@ -185,7 +201,13 @@ fn main() -> Result<()> {
 
         let queued = requests.iter().flat_map(|r| r.try_iter());
         for request in woken.take().into_iter().chain(queued) {
-            dirty |= handle_request(&mut carousel, request, desktop.away(), renderer.frame());
+            dirty |= handle_request(
+                &mut carousel,
+                &mut night,
+                request,
+                desktop.away(),
+                renderer.frame(),
+            );
         }
 
         // Nothing to draw for until the sender has a panel; redraw once it does.
@@ -249,6 +271,21 @@ fn main() -> Result<()> {
             dirty = true;
         }
         carousel.activity(!away);
+        // At night every frame is dimmed, except the away clock's, which
+        // is dim already and would all but vanish.
+        let dark = night.dark(Local::now());
+        if dark != was_dark {
+            log.info(
+                if dark {
+                    "night: dimming"
+                } else {
+                    "night: back to day"
+                }
+                .into(),
+            );
+            was_dark = dark;
+        }
+        dirty |= renderer.set_night((dark && !show_away).then_some(config.night.brightness));
         let rotation = carousel.progress().filter(|_| config.rotate_bar);
         let screen = if show_away {
             &mut away_screen
@@ -319,7 +356,13 @@ fn idle(requests: Option<&Receiver<Request>>, length: Duration) -> Option<Reques
 
 /// Apply a queued command and transfer --wait replies to its overlay.
 /// This runs even while the USB sender is offline.
-fn handle_request(carousel: &mut Carousel, request: Request, away: bool, frame: &[u8]) -> bool {
+fn handle_request(
+    carousel: &mut Carousel,
+    night: &mut Night,
+    request: Request,
+    away: bool,
+    frame: &[u8],
+) -> bool {
     let Request {
         command,
         reply,
@@ -342,6 +385,7 @@ fn handle_request(carousel: &mut Carousel, request: Request, away: bool, frame: 
     let wait = matches!(&command, Command::Content(c) if c.wait);
     let outcome = match command {
         Command::Snapshot(path) => snapshot(frame, &path),
+        Command::Night(mode) => Ok(night.command(mode, Local::now())),
         Command::Next if carousel.flashing() || carousel.timer_up() => {
             carousel.command(Command::Next)
         }
@@ -622,6 +666,7 @@ impl Carousel {
                 self.flash = Some(Overlay::new(content.screen(), duration));
             }
             Command::Snapshot(_) => return Err("snapshots are taken by the frame loop".into()),
+            Command::Night(_) => return Err("night mode is the frame loop's".into()),
             Command::Timer(length) => {
                 let ends = Local::now() + TimeDelta::from_std(length).map_err(|e| e.to_string())?;
                 self.timer = Some((screens::timer(length, ends), ends));
@@ -843,6 +888,10 @@ mod tests {
         (c, present)
     }
 
+    fn night() -> Night {
+        Night::new(&Config::default())
+    }
+
     fn carousel(n: usize) -> (Carousel, Vec<Rc<RefCell<Vec<String>>>>) {
         let alerts: Vec<_> = (0..n).map(|_| Rc::default()).collect();
         let screens = alerts
@@ -883,6 +932,8 @@ mod tests {
         assert!(parse("--screen").is_err());
         assert!(parse("--scren usage").is_err());
         assert!(parse("help").is_err(), "not a verb, so not run");
+        assert!(parse("--screen radar --preview --night").unwrap().night);
+        assert!(parse("--preview out.jpg --night").unwrap().night);
     }
 
     #[test]
@@ -1243,7 +1294,7 @@ mod tests {
             expires: None,
             order: 0,
         };
-        assert!(handle_request(&mut c, request, true, &[]));
+        assert!(handle_request(&mut c, &mut night(), request, true, &[]));
         assert!(outcome.recv().unwrap().is_ok());
         assert!(!c.flashing());
         assert!(
@@ -1265,7 +1316,7 @@ mod tests {
             expires: Some(Instant::now() - Duration::from_secs(1)),
             order: 0,
         };
-        assert!(!handle_request(&mut c, request, false, &[]));
+        assert!(!handle_request(&mut c, &mut night(), request, false, &[]));
         assert!(outcome.recv().is_err());
         assert!(c.flashing());
         let (reply, outcome) = std::sync::mpsc::channel();
@@ -1342,23 +1393,23 @@ mod tests {
     fn content_slow_to_prepare_doesnt_replace_newer_commands() {
         let (mut c, _) = carousel(2);
         let (newer, _) = request(content(content::Lifetime::UntilNext), 2);
-        assert!(handle_request(&mut c, newer, false, &[]));
+        assert!(handle_request(&mut c, &mut night(), newer, false, &[]));
         let (older, outcome) = request(content(content::Lifetime::UntilNext), 1);
-        assert!(!handle_request(&mut c, older, false, &[]));
+        assert!(!handle_request(&mut c, &mut night(), older, false, &[]));
         assert!(outcome.recv().unwrap().unwrap_err().contains("newer"));
         let (dismiss, _) = request(Command::Next, 3);
-        assert!(handle_request(&mut c, dismiss, false, &[]));
+        assert!(handle_request(&mut c, &mut night(), dismiss, false, &[]));
         let (stale, _) = request(content(content::Lifetime::UntilNext), 2);
         assert!(
-            !handle_request(&mut c, stale, false, &[]),
+            !handle_request(&mut c, &mut night(), stale, false, &[]),
             "dismissed stays dismissed"
         );
         assert!(!c.flashing());
         let (unrelated, _) = request(Command::Off("s1".into()), 5);
-        assert!(handle_request(&mut c, unrelated, false, &[]));
+        assert!(handle_request(&mut c, &mut night(), unrelated, false, &[]));
         let (image, _) = request(content(content::Lifetime::UntilNext), 4);
         assert!(
-            handle_request(&mut c, image, false, &[]),
+            handle_request(&mut c, &mut night(), image, false, &[]),
             "off doesn't touch content"
         );
     }
@@ -1373,7 +1424,7 @@ mod tests {
         // As the frame loop does each tick, unplugged too: ring, then requests.
         assert!(!c.ring(), "nothing to take down");
         let (pushed, _) = request(content(content::Lifetime::UntilNext), 1);
-        assert!(handle_request(&mut c, pushed, false, &[]));
+        assert!(handle_request(&mut c, &mut night(), pushed, false, &[]));
         assert!(!c.ring());
         assert!(c.flashing());
     }

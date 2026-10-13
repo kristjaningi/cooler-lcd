@@ -98,10 +98,7 @@ pub fn build(name: &str, config: &Config) -> Option<Box<dyn Screen>> {
         "usage" => Some(Box::new(usage::Usage::new())),
         "music" => Some(Box::new(music::Music::new())),
         "radar" => Some(Box::new(radar::Radar::new(
-            config
-                .radar
-                .center
-                .map_or(radar::CENTER, |[lat, lon]| (lat, lon)),
+            config.radar.center(),
             config.radar.heading,
         ))),
         _ => None,
