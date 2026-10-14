@@ -7,7 +7,7 @@
 //! the download and a cap on the picture's dimensions.
 
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -37,6 +37,13 @@ pub fn load(url: &str) -> Result<Pixmap> {
     let bytes = fetch(url)?;
     let art = decode(&bytes)?;
     Ok(compose(&art))
+}
+
+/// A local cover file may be overwritten at the same URL, even mid-track.
+pub(super) fn file_stamp(url: &str) -> Option<(SystemTime, u64)> {
+    let path = percent_decode(url.strip_prefix("file://")?);
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 fn fetch(url: &str) -> Result<Vec<u8>> {

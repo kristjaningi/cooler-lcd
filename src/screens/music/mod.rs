@@ -31,7 +31,6 @@ struct Content {
     title: String,
     artist: String,
     playing: bool,
-    art_url: Option<String>,
 }
 
 pub struct Music {
@@ -53,9 +52,12 @@ impl Music {
 }
 
 impl Screen for Music {
+    fn activity(&mut self, active: bool, visible: bool) {
+        self.shared.lock().unwrap().activity(active, visible);
+    }
+
     fn update(&mut self, _now: DateTime<Local>) -> bool {
-        let mut s = self.shared.lock().unwrap();
-        s.want();
+        let s = self.shared.lock().unwrap();
         self.playback = s.playback.clone();
         let art = s.art.clone();
         drop(s);
@@ -63,11 +65,15 @@ impl Screen for Music {
             title: p.track.title.clone(),
             artist: p.track.artist.clone(),
             playing: p.playing,
-            art_url: art.as_ref().map(|(url, _)| url.clone()),
         });
-        let changed = self.content != content;
+        let art_changed = match (&self.art, &art) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        let changed = self.content != content || art_changed;
         self.content = content;
-        self.art = art.map(|(_, px)| px);
+        self.art = art;
         changed
     }
 
@@ -177,5 +183,29 @@ fn paused(px: &mut Pixmap) {
     );
     for dx in [-9.0, 3.0] {
         rounded_rect(px, cx + dx, cy - 12.0, 6.0, 24.0, 2.0, WHITE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_new_image_at_the_same_url_redraws_the_screen() {
+        let shared = mpris::Shared::default();
+        let mut music = Music {
+            shared: shared.clone(),
+            playback: None,
+            content: None,
+            art: None,
+        };
+        assert!(!music.update(Local::now()));
+        shared.lock().unwrap().art = Some(Arc::new(Pixmap::new(SIZE, SIZE).unwrap()));
+        assert!(music.update(Local::now()));
+        assert!(!music.update(Local::now()));
+        shared.lock().unwrap().art = Some(Arc::new(Pixmap::new(SIZE, SIZE).unwrap()));
+        assert!(
+            music.update(Local::now()),
+            "image identity matters even when content stays the same"
+        );
     }
 }
