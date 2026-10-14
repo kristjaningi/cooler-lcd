@@ -1,6 +1,8 @@
 //! Drawing helpers shared by all screens. Pixmaps are always fully opaque,
 //! so tiny-skia's premultiplied RGBA is plain RGBA.
 
+pub(crate) mod text_cache;
+
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use tiny_skia::{
     FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path, PathBuilder, Pixmap,
