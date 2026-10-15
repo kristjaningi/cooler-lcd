@@ -12,7 +12,7 @@
 A tiny driver for the 480x480 screen on Thermalright Vision coolers (USB
 `87ad:70db`, e.g. Phantom Spirit 120 Vision), and a lightweight replacement
 for TRCC. It cycles through screens, follows theme switches live, and takes
-commands from scripts and Claude Code hooks.
+commands from scripts and keybindings.
 
 ## Screens
 
@@ -123,23 +123,6 @@ suspended counts.
 While the desktop is away, `next` and `show` are refused, but a flash still
 shows over the dim clock for its rotation, and so does a running timer.
 One that's up waits behind the clock until you're back.
-
-To have the cooler show Claude Code's notifications (permission prompts,
-waiting for input), add a `Notification` hook to `~/.claude/settings.json`:
-
-```json
-"Notification": [
-  {
-    "hooks": [
-      {
-        "type": "command",
-        "async": true,
-        "command": "cooler-lcd flash \"$(jq -r '.message // \"Claude needs you\"')\" >/dev/null 2>&1 || true"
-      }
-    ]
-  }
-]
-```
 
 ## Config
 

@@ -1,5 +1,5 @@
-//! Commands for the running service over a Unix socket, so scripts, hooks
-//! and keybindings can steer the panel:
+//! Commands for the running service over a Unix socket, so scripts and
+//! keybindings can steer the panel:
 //!
 //!   cooler-lcd next          show the next screen
 //!   cooler-lcd show NAME     jump to a configured screen
@@ -331,9 +331,7 @@ mod tests {
     fn parses_commands() {
         assert!(matches!(parse("next\n"), Ok(Command::Next)));
         assert!(matches!(parse("show radar"), Ok(Command::Show(n)) if n == "radar"));
-        assert!(
-            matches!(parse("flash Claude needs you  \n"), Ok(Command::Flash(t)) if t == "Claude needs you")
-        );
+        assert!(matches!(parse("flash Back in 5  \n"), Ok(Command::Flash(t)) if t == "Back in 5"));
         assert!(matches!(parse("toggle radar"), Ok(Command::Toggle(n)) if n == "radar"));
         assert!(matches!(parse("off radar"), Ok(Command::Off(n)) if n == "radar"));
         assert!(parse("on").is_err());

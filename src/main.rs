@@ -763,8 +763,7 @@ mod tests {
     #[test]
     fn a_flash_gets_its_full_turn_once_drawn() {
         let (mut c, _) = carousel(2);
-        c.command(Command::Flash("Claude needs you".into()))
-            .unwrap();
+        c.command(Command::Flash("Back in 5".into())).unwrap();
         assert_eq!(c.progress(), None, "no countdown over a flash");
         // Not yet drawn (the panel is unplugged, say), it doesn't run out.
         assert!(!tick(&mut c));
@@ -804,8 +803,7 @@ mod tests {
     #[test]
     fn a_timer_holds_the_panel_until_dismissed() {
         let (mut c, alerts) = carousel(2);
-        c.command(Command::Flash("Claude needs you".into()))
-            .unwrap();
+        c.command(Command::Flash("Back in 5".into())).unwrap();
         c.command(Command::Timer(Duration::from_secs(1500)))
             .unwrap();
         assert!(c.timing());
