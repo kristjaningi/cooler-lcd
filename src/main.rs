@@ -136,7 +136,7 @@ fn main() -> Result<()> {
     let mut renderer = Renderer::new();
 
     if let Some(path) = args.preview {
-        let screen = carousel.current();
+        let screen = carousel.current(false);
         screen.update(Local::now());
         // Give background fetchers (network data) a moment to deliver.
         for _ in 0..50 {
@@ -225,15 +225,17 @@ fn main() -> Result<()> {
         }
         // Expire a flash before choosing what to show, so the carousel's
         // screens never get drawn while away, not even for one tick.
+        dirty |= carousel.ring();
         dirty |= if away {
             carousel.expire_flash()
         } else {
             carousel.advance(&mut log)
         };
         // A running timer shows over the dim clock; one that's up waits
-        // behind it, so it doesn't glow all night.
-        let show_away =
-            away && !carousel.flashing() && !(carousel.timing() && !carousel.timer_up());
+        // behind it, so it doesn't glow all night, as does held content.
+        let show_away = away
+            && carousel.overlay(away).is_none()
+            && !(carousel.timing() && !carousel.timer_up());
         if show_away != showed_away {
             showed_away = show_away;
             dirty = true;
@@ -242,7 +244,7 @@ fn main() -> Result<()> {
         let screen = if show_away {
             &mut away_screen
         } else {
-            carousel.current()
+            carousel.current(away)
         };
         // Each screen updates at its own pace (and right away after a
         // switch or a theme change); the bar moves in between.
@@ -274,7 +276,7 @@ fn main() -> Result<()> {
                 Ok(()) => {
                     dirty = false;
                     shown_bar = bar;
-                    let receipt = carousel.flash.as_ref().map(|f| f.receipt.clone());
+                    let receipt = carousel.overlay(away).map(|f| f.receipt.clone());
                     sender.publish(renderer.frame(), receipt);
                 }
                 Err(e) => log.error(format!("rendering: {e:#}")),
@@ -282,8 +284,7 @@ fn main() -> Result<()> {
         }
 
         let wake = carousel
-            .flash
-            .as_ref()
+            .overlay(away)
             .and_then(Overlay::wake)
             .map_or(wake, |deadline| wake.min(deadline));
         sleep(wake.saturating_duration_since(Instant::now()));
@@ -341,6 +342,8 @@ struct Carousel {
     flash: Option<Overlay>,
     /// A countdown from `cooler-lcd timer` and when it's up.
     timer: Option<(Box<dyn Screen>, DateTime<Local>)>,
+    /// Whether the timer's time being up has taken down pushed content.
+    rang: bool,
     screens: Vec<(String, Box<dyn Screen>)>,
     /// Which screens are in the rotation; at least one always is. One
     /// that's off is only shown when asked for by name, and doesn't take
@@ -440,6 +443,7 @@ impl Carousel {
         Self {
             flash: None,
             timer: None,
+            rang: false,
             seen: vec![HashMap::new(); screens.len()],
             on: vec![true; screens.len()],
             screens,
@@ -456,6 +460,11 @@ impl Carousel {
     /// current one's time is up. Returns true on a switch.
     fn advance(&mut self, log: &mut Log) -> bool {
         if self.flash.is_some() {
+            // Alerts under pushed content are still noticed, and take
+            // their turn once it's down.
+            if self.screens.len() >= 2 && self.timer.is_none() {
+                self.check_alerts(log);
+            }
             return self.expire_flash();
         }
         // The rotation, takeovers included, waits for the timer.
@@ -561,9 +570,6 @@ impl Carousel {
                     false => self.turn_on(&name),
                 };
             }
-            Command::Flash(text) => {
-                self.flash = Some(Overlay::new(screens::flash(text), Some(self.rotate)))
-            }
             Command::Content(content) => {
                 let duration = match content.lifetime {
                     content::Lifetime::Rotation => Some(self.rotate),
@@ -576,6 +582,7 @@ impl Carousel {
             Command::Timer(length) => {
                 let ends = Local::now() + TimeDelta::from_std(length).map_err(|e| e.to_string())?;
                 self.timer = Some((screens::timer(length, ends), ends));
+                self.rang = false;
                 self.flash = None;
                 return Ok(ends.format("until %H:%M").to_string());
             }
@@ -617,8 +624,8 @@ impl Carousel {
         if !self.screens[i].1.present() {
             return Ok(format!("{name} on, shown once it has something to show"));
         }
-        // Not from under a timer; it comes up after.
-        if self.timing() {
+        // Not from under a timer or pushed content; it comes up after.
+        if self.timing() || self.flashing() {
             self.index = i;
         } else {
             self.switch_to(i);
@@ -669,6 +676,17 @@ impl Carousel {
             .is_some_and(|(_, ends)| Local::now() >= *ends)
     }
 
+    /// Takes down pushed content when the timer under it runs out, so the
+    /// panel says time's up. Content pushed after that still goes over it.
+    /// Returns true if it took some down.
+    fn ring(&mut self) -> bool {
+        if self.rang || !self.timer_up() {
+            return false;
+        }
+        self.rang = true;
+        self.flash.take().is_some()
+    }
+
     /// Takes down a flash whose time is up. Returns true if it did.
     fn expire_flash(&mut self) -> bool {
         let expired = self.flash.as_ref().is_some_and(|f| {
@@ -701,8 +719,18 @@ impl Carousel {
         self.flash.is_some()
     }
 
-    fn current(&mut self) -> &mut Box<dyn Screen> {
-        if let Some(flash) = &mut self.flash {
+    /// The pushed content on display, if any. Content held until `next`
+    /// waits behind the away clock, like a timer that's up.
+    fn overlay(&self, away: bool) -> Option<&Overlay> {
+        self.flash
+            .as_ref()
+            .filter(|f| !(away && f.duration.is_none()))
+    }
+
+    fn current(&mut self, away: bool) -> &mut Box<dyn Screen> {
+        if let Some(flash) = &mut self.flash
+            && !(away && flash.duration.is_none())
+        {
             return &mut flash.screen;
         }
         match &mut self.timer {
@@ -854,8 +882,10 @@ mod tests {
     #[test]
     fn a_flash_gets_its_full_turn_once_drawn() {
         let (mut c, _) = carousel(2);
-        c.command(Command::Flash("Claude needs you".into()))
-            .unwrap();
+        c.command(Command::Content(content::Prepared::message(
+            "Claude needs you".into(),
+        )))
+        .unwrap();
         assert_eq!(c.progress(), None, "no countdown over a flash");
         // Not yet drawn (the panel is unplugged, say), it doesn't run out.
         assert!(!tick(&mut c));
@@ -896,8 +926,10 @@ mod tests {
     #[test]
     fn a_timer_holds_the_panel_until_dismissed() {
         let (mut c, alerts) = carousel(2);
-        c.command(Command::Flash("Claude needs you".into()))
-            .unwrap();
+        c.command(Command::Content(content::Prepared::message(
+            "Claude needs you".into(),
+        )))
+        .unwrap();
         c.command(Command::Timer(Duration::from_secs(1500)))
             .unwrap();
         assert!(c.timing());
@@ -955,7 +987,10 @@ mod tests {
         assert_eq!(c.index, 1);
         // A flash still goes over a timer for its turn.
         c.command(Command::Timer(Duration::from_secs(60))).unwrap();
-        c.command(Command::Flash("Build finished".into())).unwrap();
+        c.command(Command::Content(content::Prepared::message(
+            "Build finished".into(),
+        )))
+        .unwrap();
         assert!(c.flashing() && c.timing());
     }
 
@@ -1102,5 +1137,54 @@ mod tests {
         c.command(Command::Next).unwrap();
         assert!(outcome.recv().unwrap().unwrap_err().contains("dismissed"));
         assert!(receipt.sent_at().is_none());
+    }
+
+    #[test]
+    fn alerts_under_held_content_take_their_turn_once_it_is_down() {
+        let (mut c, alerts) = carousel(2);
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        alerts[1].replace(vec!["CPU over 85°".into()]);
+        assert!(!tick(&mut c), "held content isn't pre-empted");
+        assert!(c.flashing());
+        c.command(Command::Next).unwrap();
+        assert!(tick(&mut c));
+        assert_eq!(c.index, 1, "the alert seen meanwhile comes next");
+    }
+
+    #[test]
+    fn a_timer_running_out_takes_down_held_content_once() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        assert!(!c.ring(), "still running");
+        if let Some((_, ends)) = &mut c.timer {
+            *ends = Local::now();
+        }
+        assert!(c.ring());
+        assert!(!c.flashing() && c.timer_up());
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        assert!(!c.ring(), "content pushed after it rang stays");
+        assert!(c.flashing());
+    }
+
+    #[test]
+    fn turning_a_screen_on_leaves_pushed_content_up() {
+        let (mut c, _) = carousel(2);
+        c.on[1] = false;
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        c.command(Command::On("s1".into())).unwrap();
+        assert!(c.flashing());
+        assert_eq!(c.index, 1, "it comes up after");
+    }
+
+    #[test]
+    fn held_content_waits_behind_the_away_clock() {
+        let (mut c, _) = carousel(2);
+        c.command(content(content::Lifetime::For(Duration::from_secs(30))))
+            .unwrap();
+        assert!(c.overlay(true).is_some(), "a timed message still shows");
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        assert!(c.overlay(true).is_none());
+        assert!(c.overlay(false).is_some(), "and is back with the desktop");
     }
 }

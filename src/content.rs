@@ -59,6 +59,20 @@ pub enum Visual {
 }
 
 impl Prepared {
+    /// A plain message for one rotation, as the legacy `flash TEXT` line
+    /// asks for.
+    pub fn message(message: String) -> Self {
+        Self {
+            visual: Visual::Flash {
+                message,
+                color: None,
+                icon: None,
+            },
+            lifetime: Lifetime::Rotation,
+            wait: false,
+        }
+    }
+
     pub fn screen(self) -> Box<dyn Screen> {
         match self.visual {
             Visual::Flash {
@@ -112,7 +126,7 @@ impl Submission {
                     ensure!(slot.is_none(), "{arg} was given twice");
                     *slot = Some(value);
                 }
-                _ if arg.starts_with('-') => {
+                _ if looks_like_option(arg) => {
                     bail!("unknown option {arg:?}; use -- before literal text or filenames")
                 }
                 _ => words.push(arg.clone()),
@@ -136,6 +150,19 @@ impl Submission {
         let submission = Self { source, options };
         submission.validate()?;
         Ok(submission)
+    }
+
+    /// Whether this submission says nothing an old service's plain
+    /// `flash TEXT` line can't.
+    pub fn plain_message(&self) -> Option<&str> {
+        match &self.source {
+            Source::Flash { message }
+                if self.options == Options::default() && !message.contains(['\n', '\r']) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        }
     }
 
     fn validate(&self) -> Result<(Lifetime, Option<Rgb>)> {
@@ -198,6 +225,15 @@ impl Submission {
     }
 }
 
+/// A misspelled option rather than message text: `--wiat` or `-w`, but not
+/// `-`, `-3°C` or a quoted phrase like "--verbose build failed".
+fn looks_like_option(arg: &str) -> bool {
+    let name = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
+    name.and_then(|n| n.chars().next())
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && !arg.contains(char::is_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +279,27 @@ mod tests {
         );
         let literal = Submission::from_args(&args(&["flash", "--", "--wait"])).unwrap();
         assert!(!literal.options.wait);
-        assert!(matches!(literal.source, Source::Flash { message } if message == "--wait"));
+        assert!(matches!(&literal.source, Source::Flash { message } if message == "--wait"));
+        for (words, expected) in [
+            (
+                &["flash", "Tests", "passed", "-", "42/42"][..],
+                "Tests passed - 42/42",
+            ),
+            (&["flash", "-3°C", "outside"], "-3°C outside"),
+            (
+                &["flash", "--verbose build failed"],
+                "--verbose build failed",
+            ),
+        ] {
+            let request = Submission::from_args(&args(words)).unwrap();
+            assert!(
+                matches!(&request.source, Source::Flash { message } if message == expected),
+                "{words:?}"
+            );
+            assert_eq!(request.plain_message(), Some(expected));
+        }
+        assert_eq!(literal.plain_message(), Some("--wait"));
+        assert_eq!(request.plain_message(), None, "options need JSON");
         assert!(matches!(
             Submission::from_args(&args(&["flash", "hello"]))
                 .unwrap()
@@ -271,6 +327,7 @@ mod tests {
             vec!["image", "x.png", "--color", "ff0000"],
             vec!["image", "x.png", "--icon", "+"],
             vec!["flash", "hello", "--unknown"],
+            vec!["flash", "hello", "-w"],
         ] {
             assert!(Submission::from_args(&args(&words)).is_err(), "{words:?}");
         }

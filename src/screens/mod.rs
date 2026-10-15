@@ -49,8 +49,7 @@ pub trait Screen {
     /// Every condition worth taking over the panel for right now, each as a
     /// short text that stays the same for as long as the condition lasts.
     /// Asked about once a second while the carousel is showing (not while
-    /// away, flashing or timing, and not with a single screen), whether or
-    /// not this
+    /// away or timing, and not with a single screen), whether or not this
     /// screen is the visible one, so keep it cheap. A condition the carousel
     /// hasn't seen in a while brings this screen to the front for one
     /// rotation; one that lasts, or flickers on and off, doesn't again.
@@ -105,17 +104,12 @@ pub fn away() -> Box<dyn Screen> {
     Box::new(away::Away::new())
 }
 
-/// A message from `cooler-lcd flash`.
-pub fn flash(message: String) -> Box<dyn Screen> {
-    self::message(message, None, None)
-}
-
 /// A countdown from `cooler-lcd timer`, `length` long and up at `ends`.
 pub fn timer(length: Duration, ends: DateTime<Local>) -> Box<dyn Screen> {
     Box::new(timer::Timer::new(length, ends))
 }
 
-/// A styled script message.
+/// A message from `cooler-lcd flash`, maybe styled.
 pub fn message(message: String, color: Option<Rgb>, icon: Option<String>) -> Box<dyn Screen> {
     Box::new(flash::Flash::new(message, color, icon))
 }
