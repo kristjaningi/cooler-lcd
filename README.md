@@ -99,6 +99,8 @@ cooler-lcd on radar                    # put a screen in the rotation and show i
 cooler-lcd off radar                   # take it out again
 cooler-lcd toggle radar                # one or the other; prints which
 cooler-lcd flash "Build finished"      # show a message for one rotation
+cooler-lcd image chart.png --for 30s   # fill the panel with an image for 30 seconds
+cooler-lcd image status.png --until-next --wait # hold it and wait for delivery
 cooler-lcd snapshot panel.jpg          # save what the panel shows as a JPEG
 cooler-lcd timer 25m                   # count down on the panel (1h30m, 90s, 25)
 cooler-lcd timer stop                  # cancel it
@@ -115,14 +117,58 @@ config lists it under `off`.
 
 A timer holds the panel while it runs: a huge ring running down around the
 minutes and seconds left. The rotation and takeovers wait, and `next` and
-`show` are refused, though a flash still shows over it for its rotation.
+`show` are refused, though pushed messages and images still show over it.
 When time's up it counts the time since until `cooler-lcd next` (or
 `timer stop`) dismisses it. It runs on the wall clock, so time spent
 suspended counts.
 
-While the desktop is away, `next` and `show` are refused, but a flash still
-shows over the dim clock for its rotation, and so does a running timer.
-One that's up waits behind the clock until you're back.
+While the desktop is away, `next` and `show` are refused, but pushed content
+still shows over the dim clock, and so does a running timer. `next` can
+always dismiss pushed content, including over a running timer.
+A timer that's up, and content held with `--until-next`, wait behind the
+clock until you're back.
+
+### Push content from scripts
+
+```sh
+cooler-lcd image "reports/build chart.png" --for 30s
+cooler-lcd flash "Build passed" --color '#22c55e' --icon '+' --for 10s
+cooler-lcd flash "Deployment needs attention" --until-next --wait
+cooler-lcd next                        # dismiss pushed content
+cooler-lcd flash -- "--literal text"  # text beginning with an option
+```
+
+Messages and images show for one rotation by default. `--for` accepts the
+same lengths as timers (`30s`, `2m`, `1h30m`, or bare minutes), from one
+second through 24 hours. `--until-next` holds content until `next`, a new
+submission, or another command that replaces it. `--for` and
+`--until-next` cannot be combined.
+
+`--wait` blocks until the first frame has been successfully sent over USB.
+Without it, success means the service accepted the content. Its display
+time starts with that first send, so an image submitted while unplugged
+still gets its full turn after reconnection. A waiting command fails if
+its content is replaced or dismissed before it is shown. This is a single
+overlay: new submissions replace older ones, rather than joining a queue.
+
+Images are centered, scaled to cover 480×480 and cropped, with EXIF
+orientation applied and transparency on black. JPEG, PNG, WebP, GIF, BMP,
+ICO and TIFF are supported; animated files show their first frame. Input
+must be a local regular file, at most 10 MiB and 4096 pixels per side.
+Decoding and resizing run outside the frame loop. Once accepted, the
+source file can be removed.
+
+For messages, `--color '#rrggbb'` sets the accent bar and icon color.
+`--icon TEXT` puts 1–4 printable characters above the message using the
+current theme font; choose a symbol that font contains. These options
+apply only to `flash`. Messages are limited to 1024 bytes.
+
+Pushed content covers the carousel, away clock or timer. Dismissing it
+reveals what it covered; a timer keeps counting while covered. `next`
+dismisses the content first and leaves a running timer intact. When a
+covered timer runs out, the content comes down so you see time's up.
+Alerts that come up meanwhile take over once the content is gone, and
+`on NAME` queues its screen behind the content rather than replacing it.
 
 To have the cooler show Claude Code's notifications (permission prompts,
 waiting for input), add a `Notification` hook to `~/.claude/settings.json`:

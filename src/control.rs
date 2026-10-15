@@ -7,10 +7,12 @@
 //!   cooler-lcd off NAME      take a screen out of the rotation
 //!   cooler-lcd toggle NAME   one or the other
 //!   cooler-lcd flash TEXT    show a message for one rotation
+//!   cooler-lcd image FILE    show a scaled/cropped local image
 //!   cooler-lcd snapshot FILE save what the panel shows as a JPEG
 //!   cooler-lcd timer 25m     count down on the panel; `timer stop` cancels
 //!
-//! One command per connection, one line each way: the command, then `ok`
+//! One command per connection, one line each way: a legacy command or JSON
+//! content submission, then `ok`
 //! (with a message for the user after a space, if there is one) or
 //! `error: ...`.
 
@@ -19,26 +21,31 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::content::{Prepared, Submission, Visual};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
 pub const VERBS: &[&str] = &[
-    "next", "show", "on", "off", "toggle", "flash", "snapshot", "timer",
+    "next", "show", "on", "off", "toggle", "flash", "image", "snapshot", "timer",
 ];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// The whole command has to arrive within this, however it trickles in.
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Extra time an image gets to be read, decoded and resized.
+const IMAGE_BUDGET: Duration = Duration::from_secs(30);
+/// How often a --wait connection checks that its client is still there.
+const HANGUP_CHECK: Duration = Duration::from_secs(1);
 /// Longest command accepted, in bytes.
-const MAX_LINE: usize = 1024;
+const MAX_LINE: usize = 16 * 1024;
 /// The longest timer accepted.
 const MAX_TIMER: Duration = Duration::from_secs(24 * 60 * 60);
 /// Connections served at once; more are turned away.
@@ -53,7 +60,8 @@ pub enum Command {
     On(String),
     Off(String),
     Toggle(String),
-    Flash(String),
+    /// A fully prepared image or styled message; no I/O on the frame loop.
+    Content(Prepared),
     /// Where to save the frame on the panel; an absolute path, since the
     /// service doesn't share the client's working directory.
     Snapshot(PathBuf),
@@ -65,13 +73,20 @@ pub enum Command {
 
 /// A command from the socket, with where to send its outcome. Once
 /// `expires` has passed the client has been told there was no answer, so
-/// the command is dropped instead of carried out late.
+/// the command is dropped instead of carried out late. --wait submissions
+/// have no deadline and are answered after delivery, replacement or dismissal.
 pub struct Request {
     pub command: Command,
     /// Ok with a message for the user (maybe empty), or why it failed.
     pub reply: mpsc::Sender<Result<String, String>>,
-    pub expires: Instant,
+    pub expires: Option<Instant>,
+    /// When the connection was accepted, relative to the others, so
+    /// content that was slow to prepare can't replace newer commands.
+    pub order: u64,
 }
+
+/// Numbers connections in the order they're accepted.
+static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
 /// The per-user runtime directory, which only this user can get into.
 /// There's no safe shared fallback, so without it there's no socket.
@@ -123,7 +138,9 @@ pub fn listen(lock: File) -> Result<mpsc::Receiver<Request>> {
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-    let (tx, rx) = mpsc::channel();
+    // Requests can own a full image; bound retained frames if the frame
+    // loop stalls instead of accumulating expired submissions.
+    let (tx, rx) = mpsc::sync_channel(MAX_CLIENTS);
     thread::spawn(move || {
         let _lock = lock;
         let active = Arc::new(AtomicUsize::new(0));
@@ -169,30 +186,102 @@ fn refuse(stream: &UnixStream, why: &str) {
     let _ = (&*stream).write_all(format!("error: {why}\n").as_bytes());
 }
 
-fn serve(stream: UnixStream, requests: &mpsc::Sender<Request>) {
+/// How long a client waits for its reply, from sending its command. The
+/// service gives up a little sooner, so it never carries out a command
+/// the client has already reported as failed.
+fn reply_budget(image: bool) -> Duration {
+    READ_DEADLINE + REPLY_TIMEOUT + if image { IMAGE_BUDGET } else { Duration::ZERO }
+}
+
+fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
+    let accepted = Instant::now();
+    let order = ACCEPTED.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let outcome = read_command(&stream, Instant::now() + READ_DEADLINE)
+    let outcome = read_command(&stream, accepted + READ_DEADLINE)
         .and_then(|line| parse(&line))
         .and_then(|command| {
+            let (wait, image) = match &command {
+                Command::Content(c) => (c.wait, matches!(c.visual, Visual::Image(_))),
+                _ => (false, false),
+            };
+            // Accepted before the client started its clock.
+            let deadline = accepted + reply_budget(image) - Duration::from_millis(500);
+            if !wait && Instant::now() >= deadline {
+                return Err("preparing the content took too long; not carried out".into());
+            }
             let (reply, outcome) = mpsc::channel();
-            let expires = Instant::now() + REPLY_TIMEOUT;
+            let expires = (!wait).then_some(deadline);
             requests
-                .send(Request {
+                .try_send(Request {
                     command,
                     reply,
                     expires,
+                    order,
                 })
-                .map_err(|_| "shutting down".to_string())?;
-            outcome
-                .recv_timeout(REPLY_TIMEOUT)
-                .unwrap_or_else(|_| Err("no answer from the frame loop; not carried out".into()))
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Full(_) => "frame loop busy, try again".to_string(),
+                    mpsc::TrySendError::Disconnected(_) => "shutting down".to_string(),
+                })?;
+            if wait {
+                wait_for(&stream, &outcome)
+            } else {
+                let left = deadline.saturating_duration_since(Instant::now());
+                outcome.recv_timeout(left).unwrap_or_else(|_| {
+                    Err("no answer from the frame loop; not carried out".into())
+                })
+            }
         });
     let reply = match outcome {
         Ok(message) if message.is_empty() => "ok\n".to_string(),
         Ok(message) => format!("ok {message}\n"),
-        Err(e) => format!("error: {e}\n"),
+        Err(e) => format!("error: {}\n", e.replace(['\n', '\r'], " ")),
     };
     let _ = (&stream).write_all(reply.as_bytes());
+}
+
+/// Waits for a --wait submission to be shown, replaced or dismissed, or
+/// for its client to give up, so a Ctrl-C'd client doesn't hold on to a
+/// connection slot until then.
+fn wait_for(
+    stream: &UnixStream,
+    outcome: &mpsc::Receiver<Result<String, String>>,
+) -> Result<String, String> {
+    loop {
+        match outcome.recv_timeout(HANGUP_CHECK) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("service stopped before the content was shown".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if hung_up(stream) => {
+                return Err("client went away".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// A client sends nothing after its command, so a readable end of file
+/// (or an error) means it has closed the connection.
+fn hung_up(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a local buffer on a socket we own.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match n {
+        0 => true,
+        n if n > 0 => false,
+        _ => !matches!(
+            std::io::Error::last_os_error().kind(),
+            ErrorKind::WouldBlock | ErrorKind::Interrupted
+        ),
+    }
 }
 
 /// Reads one command line, which has to arrive whole by `deadline` and be
@@ -231,6 +320,13 @@ fn read_command(mut stream: &UnixStream, deadline: Instant) -> Result<String, St
 
 fn parse(line: &str) -> Result<Command, String> {
     let line = line.trim();
+    if line.starts_with('{') {
+        return serde_json::from_str::<Submission>(line)
+            .map_err(|e| format!("invalid content request: {e}"))?
+            .prepare()
+            .map(Command::Content)
+            .map_err(|e| format!("{e:#}"));
+    }
     let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
     let rest = rest.trim();
     match (verb, rest) {
@@ -239,7 +335,9 @@ fn parse(line: &str) -> Result<Command, String> {
         ("on", name) if !name.is_empty() => Ok(Command::On(name.into())),
         ("off", name) if !name.is_empty() => Ok(Command::Off(name.into())),
         ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
-        ("flash", text) if !text.is_empty() => Ok(Command::Flash(text.into())),
+        ("flash", text) if !text.is_empty() && text.len() <= 1024 => {
+            Ok(Command::Content(Prepared::message(text.into())))
+        }
         ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
         ("timer", "stop") => Ok(Command::TimerStop),
         ("timer", length) if !length.is_empty() => parse_length(length).map(Command::Timer),
@@ -252,7 +350,7 @@ fn parse(line: &str) -> Result<Command, String> {
 
 /// A timer's length, like `25m`, `1h30m`, `90s` or a bare `25` for
 /// minutes, from a second up to `MAX_TIMER`.
-fn parse_length(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_length(s: &str) -> Result<Duration, String> {
     let bad = || format!("expected a length like 25m, 1h30m or 90s (got {s:?})");
     let s: String = s
         .chars()
@@ -295,14 +393,33 @@ fn parse_length(s: &str) -> Result<Duration, String> {
     Ok(length)
 }
 
-/// Sends one command line to the running service and returns its message
-/// for the user, if any.
-pub fn send(line: &str) -> Result<String> {
-    // Newlines would end the command early; a message is one line.
-    let line = line.replace(['\n', '\r'], " ");
-    if line.len() > MAX_LINE {
-        bail!("command too long (over {MAX_LINE} bytes)");
-    }
+/// Sends argv to the running service, preserving quoted content via JSON.
+pub fn send(args: &[String]) -> Result<String> {
+    let verb = args.first().context("missing command")?;
+    let (line, wait, image) = if matches!(verb.as_str(), "flash" | "image") {
+        let submission = Submission::from_args(args)?;
+        // A plain message goes as the old line, which a service started
+        // before an upgrade still understands.
+        let line = match submission.plain_message() {
+            Some(message) => format!("flash {message}"),
+            None => serde_json::to_string(&submission)?,
+        };
+        (line, submission.options.wait, verb == "image")
+    } else if verb == "snapshot" && args.len() > 1 {
+        let path = std::path::absolute(args[1..].join(" "))?;
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|b| matches!(b, b'\n' | b'\r'))
+        {
+            bail!("snapshot paths can't contain line breaks");
+        }
+        (format!("snapshot {}", path.display()), false, false)
+    } else {
+        (args.join(" ").replace(['\n', '\r'], " "), false, false)
+    };
+    ensure_line(&line)?;
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         anyhow!(
@@ -310,10 +427,34 @@ pub fn send(line: &str) -> Result<String> {
             path.display()
         )
     })?;
-    stream.set_read_timeout(Some(REPLY_TIMEOUT + READ_DEADLINE))?;
+    // Image preparation is done before enqueueing. Explicit --wait has no
+    // display deadline: an unplugged panel can come back much later.
+    stream.set_read_timeout((!wait).then_some(reply_budget(image)))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.write_all(format!("{line}\n").as_bytes())?;
     let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply)?;
+    let read = BufReader::new(&stream)
+        .read_line(&mut reply)
+        .map_err(|e| match e.kind() {
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                anyhow!("no answer from cooler-lcd in time; not carried out")
+            }
+            _ => e.into(),
+        })?;
+    ensure_reply(read, &reply)
+}
+
+fn ensure_line(line: &str) -> Result<()> {
+    if line.len() > MAX_LINE {
+        bail!("command too long (over {MAX_LINE} bytes)");
+    }
+    Ok(())
+}
+
+fn ensure_reply(bytes: usize, reply: &str) -> Result<String> {
+    if bytes == 0 {
+        bail!("service disconnected before replying");
+    }
     let reply = reply.trim();
     match reply.strip_prefix("ok") {
         Some(message) if message.is_empty() || message.starts_with(' ') => {
@@ -332,7 +473,7 @@ mod tests {
         assert!(matches!(parse("next\n"), Ok(Command::Next)));
         assert!(matches!(parse("show radar"), Ok(Command::Show(n)) if n == "radar"));
         assert!(
-            matches!(parse("flash Claude needs you  \n"), Ok(Command::Flash(t)) if t == "Claude needs you")
+            matches!(parse("flash Claude needs you  \n"), Ok(Command::Content(Prepared { visual: Visual::Flash { message, .. }, .. })) if message == "Claude needs you")
         );
         assert!(matches!(parse("toggle radar"), Ok(Command::Toggle(n)) if n == "radar"));
         assert!(matches!(parse("off radar"), Ok(Command::Off(n)) if n == "radar"));
@@ -417,5 +558,154 @@ mod tests {
         drop(held);
         assert!(lock_in(&dir).is_ok(), "free again once the first is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn carousel() -> crate::Carousel {
+        crate::Carousel::with_screens(
+            vec![(
+                "dashboard".into(),
+                crate::screens::message("underneath".into(), None, None),
+            )],
+            Duration::from_secs(15),
+        )
+    }
+
+    #[test]
+    fn wait_replies_after_delivery_and_reports_replacement_over_the_socket() {
+        let submission =
+            Submission::from_args(&["flash", "hello", "--wait", "--until-next"].map(String::from))
+                .unwrap();
+        let line = serde_json::to_string(&submission).unwrap();
+        for deliver in [false, true] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+            let worker = thread::spawn(move || serve(server, &tx));
+            client.write_all(format!("{line}\n").as_bytes()).unwrap();
+            let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                request.expires.is_none(),
+                "offline waits must not expire in the queue"
+            );
+            let mut carousel = carousel();
+            assert!(crate::handle_request(&mut carousel, request, false, &[]));
+            let mut reply = String::new();
+            let mut client = BufReader::new(client);
+            let error = client.read_line(&mut reply).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut
+            ));
+            if deliver {
+                carousel.flash.as_ref().unwrap().receipt.mark_sent();
+                carousel.flash_drawn();
+            } else {
+                carousel
+                    .command(Command::Content(Prepared::message("replacement".into())))
+                    .unwrap();
+            }
+            client
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.read_line(&mut reply).unwrap();
+            if deliver {
+                assert_eq!(reply, "ok\n");
+            } else {
+                assert!(reply.contains("replaced or dismissed"), "{reply}");
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_waiting_connection_lets_go_once_its_client_does() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_keep, outcome) = mpsc::channel();
+        assert!(!hung_up(&server));
+        drop(client);
+        assert!(hung_up(&server));
+        assert!(
+            wait_for(&server, &outcome)
+                .unwrap_err()
+                .contains("went away")
+        );
+    }
+
+    #[test]
+    fn invalid_images_are_rejected_before_the_frame_loop() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+        let worker = thread::spawn(move || serve(server, &tx));
+        let submission =
+            Submission::from_args(&["image", "/nonexistent/cooler-lcd.png"].map(String::from))
+                .unwrap();
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&submission).unwrap()).as_bytes())
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert!(reply.starts_with("error: opening /nonexistent/"), "{reply}");
+        assert!(requests.try_recv().is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn queued_image_is_already_decoded_and_survives_source_removal() {
+        let path =
+            std::env::temp_dir().join(format!("cooler-lcd-push image-{}.png", std::process::id()));
+        let mut original = tiny_skia::Pixmap::new(16, 16).unwrap();
+        original.fill(tiny_skia::Color::from_rgba8(20, 180, 60, 255));
+        original.save_png(&path).unwrap();
+        let submission = Submission::from_args(&[
+            "image".to_string(),
+            path.to_string_lossy().into_owned(),
+            "--for".into(),
+            "30s".into(),
+        ])
+        .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+        let worker = thread::spawn(move || serve(server, &tx));
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&submission).unwrap()).as_bytes())
+            .unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut carousel = carousel();
+        assert!(crate::handle_request(&mut carousel, request, false, &[]));
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert_eq!(reply, "ok\n", "normal submission acknowledges acceptance");
+        let theme = crate::theme::Theme::fallback();
+        let screen = carousel.current(false);
+        screen.update(chrono::Local::now());
+        let mut px = tiny_skia::Pixmap::new(480, 480).unwrap();
+        screen.draw(&mut px, &theme);
+        assert_eq!(px.pixel(240, 240).unwrap().green(), 180);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_refuses_content_without_retaining_more_frames() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, _requests) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || serve(server, &tx));
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(b"flash hello\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert!(reply.contains("busy"));
+        worker.join().unwrap();
     }
 }

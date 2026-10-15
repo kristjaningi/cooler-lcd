@@ -9,6 +9,7 @@
 mod away;
 mod dashboard;
 mod flash;
+mod image;
 mod music;
 mod radar;
 mod sensors;
@@ -21,7 +22,7 @@ use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
 
 use crate::config::Config;
-use crate::theme::Theme;
+use crate::theme::{Rgb, Theme};
 
 pub trait Screen {
     /// Refreshes the screen's data. Returns true when the picture changed and
@@ -48,8 +49,7 @@ pub trait Screen {
     /// Every condition worth taking over the panel for right now, each as a
     /// short text that stays the same for as long as the condition lasts.
     /// Asked about once a second while the carousel is showing (not while
-    /// away, flashing or timing, and not with a single screen), whether or
-    /// not this
+    /// away or timing, and not with a single screen), whether or not this
     /// screen is the visible one, so keep it cheap. A condition the carousel
     /// hasn't seen in a while brings this screen to the front for one
     /// rotation; one that lasts, or flickers on and off, doesn't again.
@@ -104,12 +104,17 @@ pub fn away() -> Box<dyn Screen> {
     Box::new(away::Away::new())
 }
 
-/// A message from `cooler-lcd flash`.
-pub fn flash(message: String) -> Box<dyn Screen> {
-    Box::new(flash::Flash::new(message))
-}
-
 /// A countdown from `cooler-lcd timer`, `length` long and up at `ends`.
 pub fn timer(length: Duration, ends: DateTime<Local>) -> Box<dyn Screen> {
     Box::new(timer::Timer::new(length, ends))
+}
+
+/// A message from `cooler-lcd flash`, maybe styled.
+pub fn message(message: String, color: Option<Rgb>, icon: Option<String>) -> Box<dyn Screen> {
+    Box::new(flash::Flash::new(message, color, icon))
+}
+
+/// An already scaled, opaque script image.
+pub fn image(picture: Pixmap) -> Box<dyn Screen> {
+    Box::new(image::Image::new(picture))
 }
