@@ -20,10 +20,29 @@ const RETRY: Duration = Duration::from_secs(3);
 /// the USB handle may be stale, so reconnect.
 const WAKE_GAP: Duration = Duration::from_secs(5);
 
+/// An overlay's first successfully transmitted frame, shared across all
+/// its redraws so replacing an unsent frame cannot lose its acknowledgement.
+#[derive(Clone, Default)]
+pub struct Receipt(Arc<Mutex<Option<Instant>>>);
+
+impl Receipt {
+    pub fn sent_at(&self) -> Option<Instant> {
+        *self.0.lock().unwrap()
+    }
+    pub fn mark_sent(&self) {
+        self.0.lock().unwrap().get_or_insert_with(Instant::now);
+    }
+}
+
+struct Frame {
+    bytes: Vec<u8>,
+    receipt: Option<Receipt>,
+}
+
 #[derive(Default)]
 struct Slot {
     /// The latest frame (header + JPEG).
-    frame: Option<Arc<Vec<u8>>>,
+    frame: Option<Arc<Frame>>,
     /// Published since the sender last picked it up.
     fresh: bool,
     connected: bool,
@@ -44,10 +63,13 @@ impl Sender {
     }
 
     /// Hands a new frame to the sender, which sends it right away.
-    pub fn publish(&self, frame: &[u8]) {
+    pub fn publish(&self, frame: &[u8], receipt: Option<Receipt>) {
         let (slot, wake) = &*self.shared;
         let mut slot = slot.lock().unwrap();
-        slot.frame = Some(Arc::new(frame.to_vec()));
+        slot.frame = Some(Arc::new(Frame {
+            bytes: frame.to_vec(),
+            receipt,
+        }));
         slot.fresh = true;
         wake.notify_one();
     }
@@ -84,11 +106,14 @@ fn run(shared: &Shared) {
             }
             clocks = now;
 
-            if let Some(frame) = frame
-                && let Err(e) = panel.send(&frame)
-            {
-                log.error(format!("{e:#}; reconnecting"));
-                break;
+            if let Some(frame) = frame {
+                if let Err(e) = panel.send(&frame.bytes) {
+                    log.error(format!("{e:#}; reconnecting"));
+                    break;
+                }
+                if let Some(receipt) = &frame.receipt {
+                    receipt.mark_sent();
+                }
             }
         }
         set_connected(shared, false);
@@ -97,7 +122,7 @@ fn run(shared: &Shared) {
 
 /// Waits for a newly published frame, or `KEEPALIVE` at most, and returns
 /// the latest frame either way.
-fn next_frame(shared: &Shared) -> Option<Arc<Vec<u8>>> {
+fn next_frame(shared: &Shared) -> Option<Arc<Frame>> {
     let (slot, wake) = &**shared;
     let mut slot = slot.lock().unwrap();
     if !slot.fresh {
@@ -109,4 +134,33 @@ fn next_frame(shared: &Shared) -> Option<Arc<Vec<u8>>> {
 
 fn set_connected(shared: &Shared, connected: bool) {
     shared.0.lock().unwrap().connected = connected;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_redraw_keeps_the_same_delivery_receipt() {
+        let sender = Sender {
+            shared: Shared::default(),
+        };
+        let receipt = Receipt::default();
+        sender.publish(b"first", Some(receipt.clone()));
+        sender.publish(b"redrawn", Some(receipt.clone()));
+        let frame = next_frame(&sender.shared).unwrap();
+        assert_eq!(frame.bytes, b"redrawn");
+        assert!(
+            receipt.sent_at().is_none(),
+            "publishing and selecting aren't delivery"
+        );
+        frame.receipt.as_ref().unwrap().mark_sent();
+        let first = receipt.sent_at().unwrap();
+        frame.receipt.as_ref().unwrap().mark_sent();
+        assert_eq!(
+            receipt.sent_at(),
+            Some(first),
+            "keepalive must not restart the lifetime"
+        );
+    }
 }

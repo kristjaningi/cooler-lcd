@@ -9,6 +9,7 @@
 mod away;
 mod dashboard;
 mod flash;
+mod image;
 mod music;
 mod radar;
 mod sensors;
@@ -21,7 +22,7 @@ use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
 
 use crate::config::Config;
-use crate::theme::Theme;
+use crate::theme::{Rgb, Theme};
 
 pub trait Screen {
     /// Background discovery is allowed while active; expensive preparation
@@ -116,10 +117,20 @@ pub fn away() -> Box<dyn Screen> {
 
 /// A message from `cooler-lcd flash`.
 pub fn flash(message: String) -> Box<dyn Screen> {
-    Box::new(flash::Flash::new(message))
+    self::message(message, None, None)
 }
 
 /// A countdown from `cooler-lcd timer`, `length` long and up at `ends`.
 pub fn timer(length: Duration, ends: DateTime<Local>) -> Box<dyn Screen> {
     Box::new(timer::Timer::new(length, ends))
+}
+
+/// A styled script message.
+pub fn message(message: String, color: Option<Rgb>, icon: Option<String>) -> Box<dyn Screen> {
+    Box::new(flash::Flash::new(message, color, icon))
+}
+
+/// An already scaled, opaque script image.
+pub fn image(picture: Pixmap) -> Box<dyn Screen> {
+    Box::new(image::Image::new(picture))
 }

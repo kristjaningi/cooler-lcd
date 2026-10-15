@@ -9,6 +9,7 @@ ab_glyph = "0.2"
 anyhow = "1"
 base64 = "0.23"
 chrono = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 libc = "0.2"
 nusb = "0.2"
