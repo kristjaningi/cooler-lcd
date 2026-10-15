@@ -27,7 +27,8 @@ struct Key {
 struct Coverage {
     min: (i32, i32),
     width: usize,
-    values: Vec<f32>,
+    /// 0..=255, a quarter of the memory of floats.
+    values: Vec<u8>,
 }
 
 impl Coverage {
@@ -45,9 +46,10 @@ impl Coverage {
         };
         let bounds = outline.px_bounds();
         let width = bounds.width() as usize;
-        let mut values = vec![0.0; width * bounds.height() as usize];
+        let mut values = vec![0; width * bounds.height() as usize];
         outline.draw(|x, y, coverage| {
-            values[y as usize * width + x as usize] = coverage.clamp(0.0, 1.0);
+            values[y as usize * width + x as usize] =
+                (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
         });
         Self {
             min: (bounds.min.x as i32, bounds.min.y as i32),
@@ -57,7 +59,7 @@ impl Coverage {
     }
 
     fn bytes(&self) -> usize {
-        self.values.len() * std::mem::size_of::<f32>()
+        self.values.len()
     }
 
     fn draw(&self, px: &mut Pixmap, origin: (i32, i32), color: Rgb) {
@@ -75,9 +77,10 @@ impl Coverage {
             let start = (-left).max(0) as usize;
             let end = (w - left).clamp(0, self.width as i32) as usize;
             for (x, &coverage) in values.iter().enumerate().take(end).skip(start) {
-                if coverage == 0.0 {
+                if coverage == 0 {
                     continue;
                 }
+                let coverage = coverage as f32 / 255.0;
                 let i = ((y * w + left + x as i32) * 4) as usize;
                 for (c, target) in [color.0, color.1, color.2].into_iter().enumerate() {
                     let dst = data[i + c] as f32;
@@ -88,14 +91,15 @@ impl Coverage {
     }
 }
 
-type Layout = (u32, Vec<(GlyphId, f32)>, f32);
+type Layout = (Vec<(GlyphId, f32)>, f32);
 
 #[derive(Default)]
 pub struct TextCache {
     #[cfg(test)]
     pub bypass: bool,
     revision: u64,
-    layouts: HashMap<String, Layout>,
+    /// By size, then text, so a lookup needn't allocate a key.
+    layouts: HashMap<u32, HashMap<String, Layout>>,
     glyphs: HashMap<Key, Coverage>,
     order: VecDeque<Key>,
     bytes: usize,
@@ -137,15 +141,21 @@ impl TextCache {
         if s.len() > 1024 {
             return super::text_aligned(px, font, s, size, x, baseline, color, align);
         }
-        if self.layouts.get(s).is_none_or(|l| l.0 != size.to_bits()) {
-            if self.layouts.len() >= MAX_LAYOUTS {
+        let size_key = size.to_bits();
+        if !self
+            .layouts
+            .get(&size_key)
+            .is_some_and(|l| l.contains_key(s))
+        {
+            if self.layouts.values().map(HashMap::len).sum::<usize>() >= MAX_LAYOUTS {
                 self.layouts.clear();
             }
-            let (glyphs, width) = layout(font, s, size);
             self.layouts
-                .insert(s.to_string(), (size.to_bits(), glyphs, width));
+                .entry(size_key)
+                .or_default()
+                .insert(s.to_string(), layout(font, s, size));
         }
-        let (_, glyphs, width) = &self.layouts[s];
+        let (glyphs, width) = &self.layouts[&size_key][s];
         let left = match align {
             Align::Left => x,
             Align::Center => x - width / 2.0,
@@ -170,6 +180,11 @@ impl TextCache {
             if !self.glyphs.contains_key(&key) {
                 let coverage = Coverage::new(font, key);
                 let bytes = coverage.bytes();
+                // Too big to keep, so it mustn't empty the cache either.
+                if bytes > MAX_BYTES {
+                    coverage.draw(px, (ox, oy), color);
+                    continue;
+                }
                 // FIFO eviction bounds both coverage memory and metadata.
                 // A hit never allocates or changes the eviction queue.
                 while !self.order.is_empty()
@@ -177,10 +192,6 @@ impl TextCache {
                 {
                     let old = self.order.pop_front().unwrap();
                     self.bytes -= self.glyphs.remove(&old).unwrap().bytes();
-                }
-                if bytes > MAX_BYTES {
-                    coverage.draw(px, (ox, oy), color);
-                    continue;
                 }
                 self.bytes += bytes;
                 self.order.push_back(key);
@@ -303,7 +314,21 @@ mod tests {
                 Align::Left,
             );
         }
-        assert!(cache.layouts.len() <= MAX_LAYOUTS);
+        assert!(cache.layouts.values().map(HashMap::len).sum::<usize>() <= MAX_LAYOUTS);
+        // The same text at another size is laid out for that size.
+        let before = cache.layouts.len();
+        cache.draw(
+            &mut px,
+            &theme.font,
+            "ICE0",
+            20.0,
+            0.0,
+            0.0,
+            Rgb(255, 255, 255),
+            Align::Left,
+        );
+        assert_eq!(cache.layouts.len(), before + 1);
+        assert!(cache.layouts[&20f32.to_bits()].contains_key("ICE0"));
         cache.prepare(theme.revision + 1);
         assert!(cache.glyphs.is_empty() && cache.layouts.is_empty() && cache.order.is_empty());
         assert_eq!(cache.bytes, 0);
