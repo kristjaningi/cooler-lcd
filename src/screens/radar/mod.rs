@@ -24,7 +24,8 @@ use tiny_skia::{
 };
 
 use super::Screen;
-use crate::draw::{Align, mix, text_aligned};
+use crate::draw::text_cache::TextCache;
+use crate::draw::{Align, mix};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
 
@@ -89,12 +90,9 @@ pub struct Radar {
     scope: Mask,
     /// The parts that never move (scope, rings, bezel, map), drawn once per
     /// theme and copied under each frame.
-    backdrop: RefCell<Option<(ThemeKey, Pixmap)>>,
+    backdrop: RefCell<Option<(u64, Pixmap)>>,
+    text: RefCell<TextCache>,
 }
-
-/// What the backdrop depends on: theme colors and the loaded font (a
-/// reloaded theme has its font at a new address).
-type ThemeKey = ([Rgb; 3], usize);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -123,6 +121,7 @@ impl Radar {
             status: Status::Acquiring,
             scope,
             backdrop: RefCell::new(None),
+            text: RefCell::new(TextCache::default()),
         }
     }
 
@@ -204,11 +203,9 @@ impl Screen for Radar {
     }
 
     fn draw(&self, px: &mut Pixmap, theme: &Theme) {
-        let p = Palette::new(theme);
-        let key = (
-            [theme.background, theme.green, theme.red],
-            theme.font.as_slice().as_ptr() as usize,
-        );
+        self.text.borrow_mut().prepare(theme.revision);
+        let p = Palette::new(theme, &self.text);
+        let key = theme.revision;
         let mut cache = self.backdrop.borrow_mut();
         if cache.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut layer = Pixmap::new(SIZE, SIZE).unwrap();
@@ -318,6 +315,7 @@ impl Screen for Radar {
 /// The theme's colors, recast as a phosphor display.
 struct Palette<'a> {
     theme: &'a Theme,
+    text: &'a RefCell<TextCache>,
     backdrop: Rgb,
     phosphor: Rgb,
     /// `phosphor` at `level` (0..=1) of full brightness over the backdrop.
@@ -327,17 +325,34 @@ struct Palette<'a> {
 }
 
 impl<'a> Palette<'a> {
-    fn new(theme: &'a Theme) -> Self {
+    fn new(theme: &'a Theme, text: &'a RefCell<TextCache>) -> Self {
         let backdrop = mix(theme.background, Rgb(0, 0, 0), 0.35);
         let phosphor = theme.green;
         Self {
             theme,
+            text,
             backdrop,
             phosphor,
             glow: std::array::from_fn(|i| mix(backdrop, phosphor, i as f32 / 10.0)),
             hot: mix(phosphor, Rgb(255, 255, 255), 0.55),
             alert: theme.red,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn text(
+        &self,
+        px: &mut Pixmap,
+        s: &str,
+        size: f32,
+        x: f32,
+        baseline: f32,
+        color: Rgb,
+        align: Align,
+    ) {
+        self.text
+            .borrow_mut()
+            .draw(px, &self.theme.font, s, size, x, baseline, color, align);
     }
 
     fn level(&self, level: f32) -> Rgb {
@@ -450,16 +465,7 @@ fn draw_scope(px: &mut Pixmap, p: &Palette, view: &View) {
         if major {
             let (x, y) = polar(45.0, nm * PX_PER_NM);
             let label = format!("{nm:.0}");
-            text_aligned(
-                px,
-                &p.theme.font,
-                &label,
-                12.0,
-                x + 3.0,
-                y - 3.0,
-                p.glow[5],
-                Align::Left,
-            );
+            p.text(px, &label, 12.0, x + 3.0, y - 3.0, p.glow[5], Align::Left);
         }
         nm += RING_NM;
     }
@@ -493,16 +499,7 @@ fn draw_scope(px: &mut Pixmap, p: &Palette, view: &View) {
                 0 => ("N".to_string(), 14.0, p.hot),
                 _ => (format!("{deg:03}"), 11.0, p.glow[5]),
             };
-            text_aligned(
-                px,
-                &p.theme.font,
-                &label,
-                size,
-                x,
-                y + size / 2.8,
-                c,
-                Align::Center,
-            );
+            p.text(px, &label, size, x, y + size / 2.8, c, Align::Center);
         }
     }
     let north = view.turn(0.0);
@@ -581,16 +578,7 @@ fn draw_map(px: &mut Pixmap, p: &Palette, view: &View, scope: &Mask) {
     }
     for (name, pos) in AIRPORTS {
         let (x, y) = view.project(*pos);
-        text_aligned(
-            px,
-            &p.theme.font,
-            name,
-            12.0,
-            x - 10.0,
-            y + 18.0,
-            p.glow[6],
-            Align::Right,
-        );
+        p.text(px, name, 12.0, x - 10.0, y + 18.0, p.glow[6], Align::Right);
     }
 }
 
@@ -753,19 +741,9 @@ fn draw_track(
         (_, true) => GOLD,
         _ => p.hot,
     };
-    text_aligned(
+    p.text(px, &ac.ident, 14.0, lx, ly, ident_color, align);
+    p.text(
         px,
-        &p.theme.font,
-        &ac.ident,
-        14.0,
-        lx,
-        ly,
-        ident_color,
-        align,
-    );
-    text_aligned(
-        px,
-        &p.theme.font,
         &data_line(ac, &p.theme.font),
         12.0,
         lx,
@@ -858,22 +836,11 @@ fn draw_hud(
     utc: DateTime<Utc>,
     up: Duration,
 ) {
-    let font = &p.theme.font;
     let (l, r, t, b) = (12.0, SIZE as f32 - 12.0, 22.0, SIZE as f32 - 12.0);
-    text_aligned(px, font, "SURV RADAR", 14.0, l, t, p.glow[9], Align::Left);
-    text_aligned(
+    p.text(px, "SURV RADAR", 14.0, l, t, p.glow[9], Align::Left);
+    p.text(px, "BIKF  BIRK", 12.0, l, t + 16.0, p.glow[5], Align::Left);
+    p.text(
         px,
-        font,
-        "BIKF  BIRK",
-        12.0,
-        l,
-        t + 16.0,
-        p.glow[5],
-        Align::Left,
-    );
-    text_aligned(
-        px,
-        font,
         &utc.format("%H:%M:%SZ").to_string(),
         14.0,
         r,
@@ -881,9 +848,8 @@ fn draw_hud(
         p.glow[9],
         Align::Right,
     );
-    text_aligned(
+    p.text(
         px,
-        font,
         &utc.format("%d %b").to_string().to_uppercase(),
         12.0,
         r,
@@ -901,12 +867,11 @@ fn draw_hud(
         ),
         Status::NoLink => ("NO LINK".into(), if blink { p.alert } else { p.backdrop }),
     };
-    text_aligned(px, font, &label, 14.0, l, b - 16.0, c, Align::Left);
-    text_aligned(px, font, "ADSB.FI", 12.0, l, b, p.glow[5], Align::Left);
+    p.text(px, &label, 14.0, l, b - 16.0, c, Align::Left);
+    p.text(px, "ADSB.FI", 12.0, l, b, p.glow[5], Align::Left);
     if status == Status::Live && icelandair > 0 {
-        text_aligned(
+        p.text(
             px,
-            font,
             &format!("ICE {icelandair:02}"),
             14.0,
             l,
@@ -926,9 +891,8 @@ fn draw_hud(
         } else {
             p.glow[8]
         };
-        text_aligned(
+        p.text(
             px,
-            font,
             &format!("{kind} {ident} {} {}", m.airport, m.runway),
             12.0,
             r,
@@ -937,9 +901,8 @@ fn draw_hud(
             Align::Right,
         );
     }
-    text_aligned(
+    p.text(
         px,
-        font,
         &format!("RNG {RANGE_NM:.0} NM"),
         14.0,
         r,
@@ -947,9 +910,8 @@ fn draw_hud(
         p.glow[9],
         Align::Right,
     );
-    text_aligned(
+    p.text(
         px,
-        font,
         &format!("{:.0} NM RINGS", RING_NM),
         12.0,
         r,
@@ -1177,5 +1139,68 @@ mod tests {
     fn polar_bearings() {
         let (x, y) = polar(90.0, 10.0);
         assert!((x - (C + 10.0)).abs() < 1e-3 && (y - C).abs() < 1e-3);
+    }
+
+    /// Run with cargo test --release radar_render_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual release-mode render benchmark"]
+    fn radar_render_benchmark() {
+        let theme = Theme::fallback();
+        for count in [0, 10, 40] {
+            for bypass in [true, false] {
+                let mut radar = Radar::new(CENTER, 0.0);
+                for i in 0..count {
+                    let key = format!("{i:06x}");
+                    radar.tracks.insert(
+                        key.clone(),
+                        Track {
+                            ac: adsb::Aircraft {
+                                hex: key,
+                                ident: format!("ABC{i:03}"),
+                                lat: CENTER.0 + (i % 5) as f32 * 0.02,
+                                lon: CENTER.1 + (i / 5) as f32 * 0.02,
+                                alt: Some(3000),
+                                gs: Some(180.0),
+                                track: Some(90.0 + i as f32 * 3.0),
+                                vrate: Some(-500),
+                                emergency: false,
+                                fixed_at: radar.started,
+                            },
+                            history: VecDeque::new(),
+                        },
+                    );
+                }
+                let mut renderer = crate::render::Renderer::new();
+                radar.text.borrow_mut().prepare(theme.revision);
+                radar.text.borrow_mut().bypass = bypass;
+                let mut draw = Duration::ZERO;
+                let mut encode = Duration::ZERO;
+                // Move targets through subpixel positions and warm caches
+                // before timing; no USB or network requests are involved.
+                for frame in 0..600 {
+                    radar.now = radar.started + Duration::from_millis(frame * 33);
+                    radar.utc =
+                        chrono::DateTime::from_timestamp(1_700_000_000 + (frame / 30) as i64, 0)
+                            .unwrap();
+                    let start = Instant::now();
+                    renderer.draw(&radar, &theme);
+                    if frame >= 300 {
+                        draw += start.elapsed();
+                    }
+                    let start = Instant::now();
+                    renderer.encode(&theme, None).unwrap();
+                    if frame >= 300 {
+                        encode += start.elapsed();
+                    }
+                }
+                eprintln!(
+                    "{count} targets, cache {}: draw {:.1}us, encode {:.1}us, coverage {} KiB",
+                    !bypass,
+                    draw.as_secs_f64() * 1e6 / 300.0,
+                    encode.as_secs_f64() * 1e6 / 300.0,
+                    radar.text.borrow().bytes() / 1024
+                );
+            }
+        }
     }
 }
