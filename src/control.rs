@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,7 +80,13 @@ pub struct Request {
     /// Ok with a message for the user (maybe empty), or why it failed.
     pub reply: mpsc::Sender<Result<String, String>>,
     pub expires: Option<Instant>,
+    /// When the connection was accepted, relative to the others, so
+    /// content that was slow to prepare can't replace newer commands.
+    pub order: u64,
 }
+
+/// Numbers connections in the order they're accepted.
+static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
 /// The per-user runtime directory, which only this user can get into.
 /// There's no safe shared fallback, so without it there's no socket.
@@ -189,6 +195,7 @@ fn reply_budget(image: bool) -> Duration {
 
 fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
     let accepted = Instant::now();
+    let order = ACCEPTED.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let outcome = read_command(&stream, accepted + READ_DEADLINE)
         .and_then(|line| parse(&line))
@@ -209,6 +216,7 @@ fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
                     command,
                     reply,
                     expires,
+                    order,
                 })
                 .map_err(|e| match e {
                     mpsc::TrySendError::Full(_) => "frame loop busy, try again".to_string(),

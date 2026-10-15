@@ -19,6 +19,7 @@ mod sender;
 mod theme;
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -173,11 +174,17 @@ fn main() -> Result<()> {
     let mut next_update = Instant::now();
     // The rotation bar's length on the panel, in pixels.
     let mut shown_bar = None;
+    // A request that cut the last sleep short.
+    let mut woken = None;
     loop {
         let tick = Instant::now();
         carousel.flash_drawn();
+        // Before any requests, so content pushed after the timer ran out
+        // isn't taken for content it ran out under, even when unplugged.
+        dirty |= carousel.ring();
 
-        for request in requests.iter().flat_map(|r| r.try_iter()) {
+        let queued = requests.iter().flat_map(|r| r.try_iter());
+        for request in woken.take().into_iter().chain(queued) {
             dirty |= handle_request(&mut carousel, request, desktop.away(), renderer.frame());
         }
 
@@ -185,7 +192,7 @@ fn main() -> Result<()> {
         if !sender.connected() {
             carousel.activity(false);
             dirty = true;
-            sleep(OFFLINE_TICK);
+            woken = idle(requests.as_ref(), OFFLINE_TICK);
             continue;
         }
 
@@ -227,7 +234,6 @@ fn main() -> Result<()> {
         }
         // Expire a flash before choosing what to show, so the carousel's
         // screens never get drawn while away, not even for one tick.
-        dirty |= carousel.ring();
         dirty |= if away {
             carousel.expire_flash()
         } else {
@@ -290,7 +296,24 @@ fn main() -> Result<()> {
             .overlay(away)
             .and_then(Overlay::wake)
             .map_or(wake, |deadline| wake.min(deadline));
-        sleep(wake.saturating_duration_since(Instant::now()));
+        woken = idle(
+            requests.as_ref(),
+            wake.saturating_duration_since(Instant::now()),
+        );
+    }
+}
+
+/// Sleeps for `length`, or until a request comes in, which it returns, so
+/// commands are carried out right away rather than at the next frame.
+fn idle(requests: Option<&Receiver<Request>>, length: Duration) -> Option<Request> {
+    match requests.map(|r| r.recv_timeout(length)) {
+        Some(Ok(request)) => Some(request),
+        Some(Err(RecvTimeoutError::Timeout)) => None,
+        // No socket, or its listener is gone.
+        _ => {
+            sleep(length);
+            None
+        }
     }
 }
 
@@ -301,10 +324,21 @@ fn handle_request(carousel: &mut Carousel, request: Request, away: bool, frame: 
         command,
         reply,
         expires,
+        order,
     } = request;
     if expires.is_some_and(|at| Instant::now() >= at) {
         return false;
     }
+    // An image takes a while to decode; one accepted before a command
+    // that has since changed what's pushed is out of date.
+    if matches!(command, Command::Content(_)) && order < carousel.overlay_order {
+        let _ = reply.send(Err("a newer command came first; not shown".into()));
+        return false;
+    }
+    let sets_overlay = matches!(
+        command,
+        Command::Content(_) | Command::Next | Command::Show(_) | Command::Timer(_)
+    );
     let wait = matches!(&command, Command::Content(c) if c.wait);
     let outcome = match command {
         Command::Snapshot(path) => snapshot(frame, &path),
@@ -317,6 +351,9 @@ fn handle_request(carousel: &mut Carousel, request: Request, away: bool, frame: 
         command => carousel.command(command),
     };
     let changed = outcome.is_ok();
+    if changed && sets_overlay {
+        carousel.overlay_order = carousel.overlay_order.max(order);
+    }
     if wait && changed {
         carousel.flash.as_mut().unwrap().reply = Some(reply);
     } else {
@@ -347,6 +384,8 @@ struct Carousel {
     timer: Option<(Box<dyn Screen>, DateTime<Local>)>,
     /// Whether the timer's time being up has taken down pushed content.
     rang: bool,
+    /// The newest accepted request that changed what's pushed.
+    overlay_order: u64,
     screens: Vec<(String, Box<dyn Screen>)>,
     /// Which screens are in the rotation; at least one always is. One
     /// that's off is only shown when asked for by name, and doesn't take
@@ -447,6 +486,7 @@ impl Carousel {
             flash: None,
             timer: None,
             rang: false,
+            overlay_order: 0,
             seen: vec![HashMap::new(); screens.len()],
             on: vec![true; screens.len()],
             screens,
@@ -1201,6 +1241,7 @@ mod tests {
             command: Command::Next,
             reply,
             expires: None,
+            order: 0,
         };
         assert!(handle_request(&mut c, request, true, &[]));
         assert!(outcome.recv().unwrap().is_ok());
@@ -1222,6 +1263,7 @@ mod tests {
             command: Command::Next,
             reply,
             expires: Some(Instant::now() - Duration::from_secs(1)),
+            order: 0,
         };
         assert!(!handle_request(&mut c, request, false, &[]));
         assert!(outcome.recv().is_err());
@@ -1280,5 +1322,59 @@ mod tests {
         c.command(content(content::Lifetime::UntilNext)).unwrap();
         assert!(c.overlay(true).is_none());
         assert!(c.overlay(false).is_some(), "and is back with the desktop");
+    }
+
+    fn request(
+        command: Command,
+        order: u64,
+    ) -> (Request, std::sync::mpsc::Receiver<Result<String, String>>) {
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let request = Request {
+            command,
+            reply,
+            expires: None,
+            order,
+        };
+        (request, outcome)
+    }
+
+    #[test]
+    fn content_slow_to_prepare_doesnt_replace_newer_commands() {
+        let (mut c, _) = carousel(2);
+        let (newer, _) = request(content(content::Lifetime::UntilNext), 2);
+        assert!(handle_request(&mut c, newer, false, &[]));
+        let (older, outcome) = request(content(content::Lifetime::UntilNext), 1);
+        assert!(!handle_request(&mut c, older, false, &[]));
+        assert!(outcome.recv().unwrap().unwrap_err().contains("newer"));
+        let (dismiss, _) = request(Command::Next, 3);
+        assert!(handle_request(&mut c, dismiss, false, &[]));
+        let (stale, _) = request(content(content::Lifetime::UntilNext), 2);
+        assert!(
+            !handle_request(&mut c, stale, false, &[]),
+            "dismissed stays dismissed"
+        );
+        assert!(!c.flashing());
+        let (unrelated, _) = request(Command::Off("s1".into()), 5);
+        assert!(handle_request(&mut c, unrelated, false, &[]));
+        let (image, _) = request(content(content::Lifetime::UntilNext), 4);
+        assert!(
+            handle_request(&mut c, image, false, &[]),
+            "off doesn't touch content"
+        );
+    }
+
+    #[test]
+    fn content_pushed_after_the_timer_ran_out_stays_up() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        if let Some((_, ends)) = &mut c.timer {
+            *ends = Local::now();
+        }
+        // As the frame loop does each tick, unplugged too: ring, then requests.
+        assert!(!c.ring(), "nothing to take down");
+        let (pushed, _) = request(content(content::Lifetime::UntilNext), 1);
+        assert!(handle_request(&mut c, pushed, false, &[]));
+        assert!(!c.ring());
+        assert!(c.flashing());
     }
 }
