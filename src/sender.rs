@@ -6,7 +6,7 @@
 //! usage reload. This thread also owns the connection: it reconnects when the
 //! cooler is unplugged, a write fails, or the machine wakes from suspend.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,14 +23,14 @@ const WAKE_GAP: Duration = Duration::from_secs(5);
 /// An overlay's first successfully transmitted frame, shared across all
 /// its redraws so replacing an unsent frame cannot lose its acknowledgement.
 #[derive(Clone, Default)]
-pub struct Receipt(Arc<Mutex<Option<Instant>>>);
+pub struct Receipt(Arc<OnceLock<Instant>>);
 
 impl Receipt {
     pub fn sent_at(&self) -> Option<Instant> {
-        *self.0.lock().unwrap()
+        self.0.get().copied()
     }
     pub fn mark_sent(&self) {
-        self.0.lock().unwrap().get_or_insert_with(Instant::now);
+        self.0.get_or_init(Instant::now);
     }
 }
 

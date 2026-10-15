@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, ensure};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits, imageops::FilterType};
@@ -14,9 +15,19 @@ use crate::render::SIZE;
 
 const MAX_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SIDE: u32 = 4096;
+/// Decoding a big image takes a few hundred MiB at its peak; one at a
+/// time keeps concurrent submissions from multiplying that.
+static DECODING: Mutex<()> = Mutex::new(());
 
 pub fn load(path: &Path) -> Result<Pixmap> {
-    // O_NONBLOCK avoids hanging a connection thread opening a named pipe.
+    // Check before opening too: opening some devices has side effects
+    // (a serial port resets the board on it).
+    let regular = std::fs::metadata(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .is_file();
+    ensure!(regular, "image must be a regular file");
+    // O_NONBLOCK avoids hanging a connection thread opening a named pipe
+    // swapped in since the check.
     let file = File::options()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -29,6 +40,7 @@ pub fn load(path: &Path) -> Result<Pixmap> {
         bytes.len() as u64 <= MAX_BYTES,
         "image is larger than 10 MiB"
     );
+    let _one = DECODING.lock().unwrap_or_else(|e| e.into_inner());
     decode(&bytes).with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -40,23 +52,22 @@ fn decode(bytes: &[u8]) -> Result<Pixmap> {
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let mut decoder = reader.into_decoder()?;
-    ensure!(
-        decoder.total_bytes() <= 128 * 1024 * 1024,
-        "decoded image is larger than 128 MiB"
-    );
-    let orientation = decoder.orientation()?;
-    let mut picture = DynamicImage::from_decoder(decoder)?;
+    // Malformed EXIF shouldn't sink an otherwise fine picture.
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    // 8-bit RGBA from here on, consuming each step's input, so a 16-bit
+    // source isn't kept alive alongside its copies.
+    let mut picture = DynamicImage::ImageRgba8(DynamicImage::from_decoder(decoder)?.into_rgba8());
     picture.apply_orientation(orientation);
     // Crop before enlarging: scaling a 4096×1 panorama to cover first
     // would allocate an enormous intermediate image just to discard it.
-    let side = picture.width().min(picture.height());
-    let cropped = picture.crop_imm(
-        (picture.width() - side) / 2,
-        (picture.height() - side) / 2,
-        side,
-        side,
-    );
-    let mut rgba = cropped.to_rgba8();
+    let (width, height) = (picture.width(), picture.height());
+    let side = width.min(height);
+    if width != height {
+        picture = picture.crop_imm((width - side) / 2, (height - side) / 2, side, side);
+    }
+    let mut rgba = picture.into_rgba8();
     // Composite before filtering so invisible RGB values in transparent
     // pixels cannot bleed into the visible edge. Renderer expects opacity.
     for p in rgba.as_mut().as_chunks_mut::<4>().0 {

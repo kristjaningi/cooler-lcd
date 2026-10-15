@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::content::{Prepared, Submission};
+use crate::content::{Prepared, Submission, Visual};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
@@ -40,6 +40,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// The whole command has to arrive within this, however it trickles in.
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Extra time an image gets to be read, decoded and resized.
+const IMAGE_BUDGET: Duration = Duration::from_secs(30);
+/// How often a --wait connection checks that its client is still there.
+const HANGUP_CHECK: Duration = Duration::from_secs(1);
 /// Longest command accepted, in bytes.
 const MAX_LINE: usize = 16 * 1024;
 /// The longest timer accepted.
@@ -56,7 +60,6 @@ pub enum Command {
     On(String),
     Off(String),
     Toggle(String),
-    Flash(String),
     /// A fully prepared image or styled message; no I/O on the frame loop.
     Content(Prepared),
     /// Where to save the frame on the panel; an absolute path, since the
@@ -177,14 +180,30 @@ fn refuse(stream: &UnixStream, why: &str) {
     let _ = (&*stream).write_all(format!("error: {why}\n").as_bytes());
 }
 
+/// How long a client waits for its reply, from sending its command. The
+/// service gives up a little sooner, so it never carries out a command
+/// the client has already reported as failed.
+fn reply_budget(image: bool) -> Duration {
+    READ_DEADLINE + REPLY_TIMEOUT + if image { IMAGE_BUDGET } else { Duration::ZERO }
+}
+
 fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
+    let accepted = Instant::now();
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let outcome = read_command(&stream, Instant::now() + READ_DEADLINE)
+    let outcome = read_command(&stream, accepted + READ_DEADLINE)
         .and_then(|line| parse(&line))
         .and_then(|command| {
-            let wait = matches!(&command, Command::Content(c) if c.wait);
+            let (wait, image) = match &command {
+                Command::Content(c) => (c.wait, matches!(c.visual, Visual::Image(_))),
+                _ => (false, false),
+            };
+            // Accepted before the client started its clock.
+            let deadline = accepted + reply_budget(image) - Duration::from_millis(500);
+            if !wait && Instant::now() >= deadline {
+                return Err("preparing the content took too long; not carried out".into());
+            }
             let (reply, outcome) = mpsc::channel();
-            let expires = (!wait).then(|| Instant::now() + REPLY_TIMEOUT);
+            let expires = (!wait).then_some(deadline);
             requests
                 .try_send(Request {
                     command,
@@ -196,11 +215,10 @@ fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
                     mpsc::TrySendError::Disconnected(_) => "shutting down".to_string(),
                 })?;
             if wait {
-                outcome
-                    .recv()
-                    .unwrap_or_else(|_| Err("service stopped before the content was shown".into()))
+                wait_for(&stream, &outcome)
             } else {
-                outcome.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| {
+                let left = deadline.saturating_duration_since(Instant::now());
+                outcome.recv_timeout(left).unwrap_or_else(|_| {
                     Err("no answer from the frame loop; not carried out".into())
                 })
             }
@@ -211,6 +229,51 @@ fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
         Err(e) => format!("error: {}\n", e.replace(['\n', '\r'], " ")),
     };
     let _ = (&stream).write_all(reply.as_bytes());
+}
+
+/// Waits for a --wait submission to be shown, replaced or dismissed, or
+/// for its client to give up, so a Ctrl-C'd client doesn't hold on to a
+/// connection slot until then.
+fn wait_for(
+    stream: &UnixStream,
+    outcome: &mpsc::Receiver<Result<String, String>>,
+) -> Result<String, String> {
+    loop {
+        match outcome.recv_timeout(HANGUP_CHECK) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("service stopped before the content was shown".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if hung_up(stream) => {
+                return Err("client went away".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// A client sends nothing after its command, so a readable end of file
+/// (or an error) means it has closed the connection.
+fn hung_up(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a local buffer on a socket we own.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match n {
+        0 => true,
+        n if n > 0 => false,
+        _ => !matches!(
+            std::io::Error::last_os_error().kind(),
+            ErrorKind::WouldBlock | ErrorKind::Interrupted
+        ),
+    }
 }
 
 /// Reads one command line, which has to arrive whole by `deadline` and be
@@ -265,7 +328,7 @@ fn parse(line: &str) -> Result<Command, String> {
         ("off", name) if !name.is_empty() => Ok(Command::Off(name.into())),
         ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
         ("flash", text) if !text.is_empty() && text.len() <= 1024 => {
-            Ok(Command::Flash(text.into()))
+            Ok(Command::Content(Prepared::message(text.into())))
         }
         ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
         ("timer", "stop") => Ok(Command::TimerStop),
@@ -327,13 +390,23 @@ pub fn send(args: &[String]) -> Result<String> {
     let verb = args.first().context("missing command")?;
     let (line, wait, image) = if matches!(verb.as_str(), "flash" | "image") {
         let submission = Submission::from_args(args)?;
-        (
-            serde_json::to_string(&submission)?,
-            submission.options.wait,
-            verb == "image",
-        )
+        // A plain message goes as the old line, which a service started
+        // before an upgrade still understands.
+        let line = match submission.plain_message() {
+            Some(message) => format!("flash {message}"),
+            None => serde_json::to_string(&submission)?,
+        };
+        (line, submission.options.wait, verb == "image")
     } else if verb == "snapshot" && args.len() > 1 {
         let path = std::path::absolute(args[1..].join(" "))?;
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|b| matches!(b, b'\n' | b'\r'))
+        {
+            bail!("snapshot paths can't contain line breaks");
+        }
         (format!("snapshot {}", path.display()), false, false)
     } else {
         (args.join(" ").replace(['\n', '\r'], " "), false, false)
@@ -348,18 +421,19 @@ pub fn send(args: &[String]) -> Result<String> {
     })?;
     // Image preparation is done before enqueueing. Explicit --wait has no
     // display deadline: an unplugged panel can come back much later.
-    let timeout = REPLY_TIMEOUT
-        + READ_DEADLINE
-        + if image {
-            Duration::from_secs(30)
-        } else {
-            Duration::ZERO
-        };
-    stream.set_read_timeout((!wait).then_some(timeout))?;
+    stream.set_read_timeout((!wait).then_some(reply_budget(image)))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.write_all(format!("{line}\n").as_bytes())?;
     let mut reply = String::new();
-    ensure_reply(BufReader::new(&stream).read_line(&mut reply)?, &reply)
+    let read = BufReader::new(&stream)
+        .read_line(&mut reply)
+        .map_err(|e| match e.kind() {
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                anyhow!("no answer from cooler-lcd in time; not carried out")
+            }
+            _ => e.into(),
+        })?;
+    ensure_reply(read, &reply)
 }
 
 fn ensure_line(line: &str) -> Result<()> {
@@ -390,7 +464,9 @@ mod tests {
     fn parses_commands() {
         assert!(matches!(parse("next\n"), Ok(Command::Next)));
         assert!(matches!(parse("show radar"), Ok(Command::Show(n)) if n == "radar"));
-        assert!(matches!(parse("flash Back in 5  \n"), Ok(Command::Flash(t)) if t == "Back in 5"));
+        assert!(
+            matches!(parse("flash Back in 5  \n"), Ok(Command::Content(Prepared { visual: Visual::Flash { message, .. }, .. })) if message == "Back in 5")
+        );
         assert!(matches!(parse("toggle radar"), Ok(Command::Toggle(n)) if n == "radar"));
         assert!(matches!(parse("off radar"), Ok(Command::Off(n)) if n == "radar"));
         assert!(parse("on").is_err());
@@ -480,7 +556,7 @@ mod tests {
         crate::Carousel::with_screens(
             vec![(
                 "dashboard".into(),
-                crate::screens::flash("underneath".into()),
+                crate::screens::message("underneath".into(), None, None),
             )],
             Duration::from_secs(15),
         )
@@ -519,7 +595,7 @@ mod tests {
                 carousel.flash_drawn();
             } else {
                 carousel
-                    .command(Command::Flash("replacement".into()))
+                    .command(Command::Content(Prepared::message("replacement".into())))
                     .unwrap();
             }
             client
@@ -534,6 +610,20 @@ mod tests {
             }
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn a_waiting_connection_lets_go_once_its_client_does() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_keep, outcome) = mpsc::channel();
+        assert!(!hung_up(&server));
+        drop(client);
+        assert!(hung_up(&server));
+        assert!(
+            wait_for(&server, &outcome)
+                .unwrap_err()
+                .contains("went away")
+        );
     }
 
     #[test]
@@ -588,7 +678,7 @@ mod tests {
         BufReader::new(client).read_line(&mut reply).unwrap();
         assert_eq!(reply, "ok\n", "normal submission acknowledges acceptance");
         let theme = crate::theme::Theme::fallback();
-        let screen = carousel.current();
+        let screen = carousel.current(false);
         screen.update(chrono::Local::now());
         let mut px = tiny_skia::Pixmap::new(480, 480).unwrap();
         screen.draw(&mut px, &theme);

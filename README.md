@@ -125,7 +125,8 @@ suspended counts.
 While the desktop is away, `next` and `show` are refused, but pushed content
 still shows over the dim clock, and so does a running timer. `next` can
 always dismiss pushed content, including over a running timer.
-A timer that's up waits behind the clock until you're back.
+A timer that's up, and content held with `--until-next`, wait behind the
+clock until you're back.
 
 ### Push content from scripts
 
@@ -164,7 +165,10 @@ apply only to `flash`. Messages are limited to 1024 bytes.
 
 Pushed content covers the carousel, away clock or timer. Dismissing it
 reveals what it covered; a timer keeps counting while covered. `next`
-dismisses the content first and leaves a running timer intact.
+dismisses the content first and leaves a running timer intact. When a
+covered timer runs out, the content comes down so you see time's up.
+Alerts that come up meanwhile take over once the content is gone, and
+`on NAME` queues its screen behind the content rather than replacing it.
 
 ## Config
 
