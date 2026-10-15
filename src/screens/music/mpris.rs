@@ -108,20 +108,31 @@ impl State {
         };
         if self.activity != next {
             self.activity = next;
-            // Discard artwork from an in-flight request after hiding; a
-            // fresh poll will identify the track when it comes back.
-            self.desired = None;
-            self.art = None;
+            // Discard artwork from an in-flight request; a fresh poll
+            // names the track again. Coming into view, the cached cover of
+            // the track still playing shows right away rather than the
+            // placeholder until that poll, which also checks the file's
+            // revision.
+            self.desired = match (&self.cached, &self.playback) {
+                (Some((key, Ok(_))), Some(playback))
+                    if next == Activity::Visible && key.names(playback) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            };
+            self.refresh_art();
             if let Some(worker) = &self.worker {
                 worker.unpark();
             }
         }
     }
 
+    /// Asked while suspended too (`on music`, coming back from away), when
+    /// the last poll is all there is. Suspended polls aren't accepted, so a
+    /// stale player still ages out after `GRACE`.
     pub fn present(&self) -> bool {
-        self.activity != Activity::Suspended
-            && self.playback.is_some()
-            && self.playing_at.is_some_and(|t| t.elapsed() < GRACE)
+        self.playback.is_some() && self.playing_at.is_some_and(|t| t.elapsed() < GRACE)
     }
 
     fn accept(&mut self, playback: Option<Playback>, desired: Option<ArtKey>) {
@@ -187,22 +198,66 @@ pub fn spawn() -> Shared {
     shared
 }
 
+/// Polls once on the caller's thread, for a command that needs to know
+/// right away whether anything's playing after the poller was parked.
+/// Blocks for the `busctl` round trips, a few ms.
+pub fn refresh(shared: &Shared) {
+    let previous = shared
+        .lock()
+        .unwrap()
+        .playback
+        .as_ref()
+        .map(|p| p.player.clone());
+    // On failure the poller says why on its next round.
+    if let Ok(playback) = poll(previous.as_deref()) {
+        publish(shared, playback);
+    }
+}
+
 /// Identity includes the player, track metadata and local file revision:
 /// players can reuse a cover path, even without changing the track ID.
+/// Not the length, which browsers and Spotify often send a poll or two
+/// after the rest, so it would load the same cover twice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArtKey {
     player: String,
-    track: Track,
+    id: Option<String>,
+    title: String,
+    artist: String,
+    url: String,
     file_stamp: Option<(SystemTime, u64)>,
 }
 
 impl ArtKey {
     fn of(playback: &Playback) -> Option<Self> {
-        let url = playback.track.art_url.as_deref()?;
+        let key = Self::unstamped(playback)?;
+        Some(Self {
+            file_stamp: art::file_stamp(&key.url),
+            ..key
+        })
+    }
+
+    fn unstamped(playback: &Playback) -> Option<Self> {
+        let track = &playback.track;
         Some(Self {
             player: playback.player.clone(),
-            track: playback.track.clone(),
-            file_stamp: art::file_stamp(url),
+            id: track.id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            url: track.art_url.clone()?,
+            file_stamp: None,
+        })
+    }
+
+    /// Whether this is `playback`'s art, as far as can be told without
+    /// looking at the file.
+    fn names(&self, playback: &Playback) -> bool {
+        Self::unstamped(playback).is_some_and(|key| {
+            *self
+                == Self {
+                    file_stamp: self.file_stamp,
+                    ..key
+                }
         })
     }
 }
@@ -224,12 +279,10 @@ fn load_next_art(shared: &Shared, load: impl FnOnce(&str) -> Result<Pixmap>) -> 
         };
         (key, tries)
     };
-    let result = load(key.track.art_url.as_deref().unwrap())
-        .map(Arc::new)
-        .map_err(|e| {
-            eprintln!("music: album art: {e:#}");
-            (Instant::now(), tries + 1)
-        });
+    let result = load(&key.url).map(Arc::new).map_err(|e| {
+        eprintln!("music: album art: {e:#}");
+        (Instant::now(), tries + 1)
+    });
     let mut s = shared.lock().unwrap();
     if s.desired.as_ref() == Some(&key) {
         s.cached = Some((key, result));
@@ -239,15 +292,21 @@ fn load_next_art(shared: &Shared, load: impl FnOnce(&str) -> Result<Pixmap>) -> 
 }
 
 /// Stat local files outside the shared lock: the frame loop must never
-/// wait for filesystem I/O on the poller's behalf.
+/// wait for filesystem I/O on the poller's behalf. If visibility flips
+/// between the two locks, the key is worked out again for the new one.
 fn publish(shared: &Shared, playback: Option<Playback>) -> Activity {
-    let visible = shared.lock().unwrap().activity == Activity::Visible;
-    let key = visible
-        .then(|| playback.as_ref().and_then(ArtKey::of))
-        .flatten();
-    let mut s = shared.lock().unwrap();
-    s.accept(playback, key);
-    s.activity
+    let mut visible = shared.lock().unwrap().activity == Activity::Visible;
+    loop {
+        let key = visible
+            .then(|| playback.as_ref().and_then(ArtKey::of))
+            .flatten();
+        let mut s = shared.lock().unwrap();
+        if (s.activity == Activity::Visible) == visible {
+            s.accept(playback, key);
+            return s.activity;
+        }
+        visible = !visible;
+    }
 }
 
 fn run(shared: &Shared) {
@@ -665,7 +724,7 @@ mod tests {
         drop(s);
         publish(&shared, Some(track("B", "https://example.test/b.jpg")));
         let s = shared.lock().unwrap();
-        assert!(!s.present());
+        assert!(s.present(), "the last poll still counts while suspended");
         assert!(s.next_art().is_none());
         assert_eq!(
             s.playback.as_ref().unwrap().track.title,
@@ -676,6 +735,42 @@ mod tests {
         assert!(!load_next_art(&shared, |_| panic!(
             "suspended screen must not fetch"
         )));
+    }
+
+    #[test]
+    fn art_stays_up_when_music_comes_back_into_view() {
+        let shared = visible();
+        publish(&shared, Some(track("A", "https://example.test/a.jpg")));
+        assert!(load_next_art(&shared, |_| Ok(
+            Pixmap::new(480, 480).unwrap()
+        )));
+        shared.lock().unwrap().activity(true, false);
+        publish(&shared, Some(track("A", "https://example.test/a.jpg")));
+        let mut s = shared.lock().unwrap();
+        s.activity(true, true);
+        assert!(s.art.is_some(), "no placeholder before the next poll");
+        assert!(s.next_art().is_none());
+        // A different track while hidden gets no stale cover.
+        s.activity(true, false);
+        drop(s);
+        publish(&shared, Some(track("B", "https://example.test/a.jpg")));
+        let mut s = shared.lock().unwrap();
+        s.activity(true, true);
+        assert!(s.art.is_none());
+    }
+
+    #[test]
+    fn a_late_length_doesnt_reload_the_cover() {
+        let shared = visible();
+        publish(&shared, Some(track("A", "https://example.test/a.jpg")));
+        assert!(load_next_art(&shared, |_| Ok(
+            Pixmap::new(480, 480).unwrap()
+        )));
+        let mut later = track("A", "https://example.test/a.jpg");
+        later.track.length = Some(Duration::from_secs(180));
+        publish(&shared, Some(later));
+        assert!(shared.lock().unwrap().art.is_some());
+        assert!(!load_next_art(&shared, |_| panic!("same cover")));
     }
 
     #[test]

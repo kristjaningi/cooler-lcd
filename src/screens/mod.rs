@@ -69,6 +69,11 @@ pub trait Screen {
         true
     }
 
+    /// Brings what `present` goes by up to date now, for a screen whose
+    /// background work was stopped while it was off. Called on the frame
+    /// loop by `on` and `toggle`, so it may block briefly, but only then.
+    fn refresh(&mut self) {}
+
     /// The screen's own progress, 0..=1, for the bar along the bottom
     /// edge to show in place of the countdown to the next screen. Asked on
     /// every frame while the screen is up, between updates too, so the
