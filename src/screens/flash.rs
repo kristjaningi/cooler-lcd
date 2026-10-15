@@ -1,5 +1,5 @@
-//! A message sent with `cooler-lcd flash TEXT` (from a Claude Code hook, a
-//! script, a keybinding), shown in large type for one rotation.
+//! A message sent with `cooler-lcd flash TEXT` (from a script or a
+//! keybinding), shown in large type for one rotation.
 
 use ab_glyph::FontVec;
 use chrono::{DateTime, Local};
