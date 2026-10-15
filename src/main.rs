@@ -6,11 +6,13 @@
 //! list.
 
 mod config;
+mod content;
 mod control;
 mod desktop;
 mod device;
 mod draw;
 mod log;
+mod picture;
 mod render;
 mod screens;
 mod sender;
@@ -30,7 +32,7 @@ use device::HEADER_LEN;
 use log::Log;
 use render::Renderer;
 use screens::Screen;
-use sender::Sender;
+use sender::{Receipt, Sender};
 use theme::Theme;
 
 /// How often to check for the panel while it's disconnected.
@@ -54,10 +56,20 @@ const USAGE: &str = "\
 usage:
   cooler-lcd [--screen NAME]                    run, cycling through the configured screens
   cooler-lcd [--screen NAME] --preview [FILE]   render one frame to a JPEG file and exit
-  cooler-lcd next | show NAME | flash TEXT      steer the running service
+  cooler-lcd next | show NAME                  steer the running service
+  cooler-lcd flash TEXT [OPTIONS]              show a message
+  cooler-lcd image FILE [OPTIONS]              show an image, scaled/cropped to 480x480
   cooler-lcd on NAME | off NAME | toggle NAME   put a screen in or out of the rotation
   cooler-lcd snapshot FILE                      save what the panel shows as a JPEG
-  cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)";
+  cooler-lcd timer LENGTH | timer stop          count down on the panel (25m, 1h30m, 90s)
+
+content options:
+  --for LENGTH       stay for this long (30s, 2m); default: one rotation
+  --until-next       stay until dismissed with next or replaced
+  --wait             wait until the first frame is sent to the panel
+  --color '#rrggbb'   accent color for a flash message
+  --icon TEXT        1-4 characters from the theme font, above the message
+  --                 treat all remaining arguments as literal content";
 
 /// The command line, past the program name, when it isn't a verb.
 #[derive(Debug, Default, PartialEq)]
@@ -93,13 +105,11 @@ fn main() -> Result<()> {
     if let Some(verb) = args.get(1)
         && control::VERBS.contains(&verb.as_str())
     {
-        let mut line = args[1..].join(" ");
-        // The service doesn't share this directory, so it gets the full path.
-        if verb == "snapshot" && args.len() > 2 {
-            let path = std::path::absolute(args[2..].join(" "))?;
-            line = format!("snapshot {}", path.display());
+        if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+            println!("{USAGE}");
+            return Ok(());
         }
-        let message = control::send(&line)?;
+        let message = control::send(&args[1..])?;
         if !message.is_empty() {
             println!("{message}");
         }
@@ -164,29 +174,10 @@ fn main() -> Result<()> {
     let mut shown_bar = None;
     loop {
         let tick = Instant::now();
+        carousel.flash_drawn();
 
-        for Request {
-            command,
-            reply,
-            expires,
-        } in requests.iter().flat_map(|r| r.try_iter())
-        {
-            // The client already gave up waiting and was told so.
-            if Instant::now() >= expires {
-                continue;
-            }
-            let outcome = match command {
-                Command::Snapshot(path) => snapshot(renderer.frame(), &path),
-                // Dismissing a timer that's up works even while away.
-                Command::Next if carousel.timer_up() => carousel.command(Command::Next),
-                // While a timer runs, the carousel says how to stop it.
-                Command::Next | Command::Show(_) if desktop.away() && !carousel.timing() => {
-                    Err("the desktop is away, so the panel shows the clock".into())
-                }
-                command => carousel.command(command),
-            };
-            dirty |= outcome.is_ok();
-            let _ = reply.send(outcome);
+        for request in requests.iter().flat_map(|r| r.try_iter()) {
+            dirty |= handle_request(&mut carousel, request, desktop.away(), renderer.frame());
         }
 
         // Nothing to draw for until the sender has a panel; redraw once it does.
@@ -283,15 +274,51 @@ fn main() -> Result<()> {
                 Ok(()) => {
                     dirty = false;
                     shown_bar = bar;
-                    sender.publish(renderer.frame());
-                    carousel.flash_drawn();
+                    let receipt = carousel.flash.as_ref().map(|f| f.receipt.clone());
+                    sender.publish(renderer.frame(), receipt);
                 }
                 Err(e) => log.error(format!("rendering: {e:#}")),
             }
         }
 
+        let wake = carousel
+            .flash
+            .as_ref()
+            .and_then(Overlay::wake)
+            .map_or(wake, |deadline| wake.min(deadline));
         sleep(wake.saturating_duration_since(Instant::now()));
     }
+}
+
+/// Apply a queued command and transfer --wait replies to its overlay.
+/// This runs even while the USB sender is offline.
+fn handle_request(carousel: &mut Carousel, request: Request, away: bool, frame: &[u8]) -> bool {
+    let Request {
+        command,
+        reply,
+        expires,
+    } = request;
+    if expires.is_some_and(|at| Instant::now() >= at) {
+        return false;
+    }
+    let wait = matches!(&command, Command::Content(c) if c.wait);
+    let outcome = match command {
+        Command::Snapshot(path) => snapshot(frame, &path),
+        Command::Next if carousel.flashing() || carousel.timer_up() => {
+            carousel.command(Command::Next)
+        }
+        Command::Next | Command::Show(_) if away && !carousel.timing() => {
+            Err("the desktop is away, so the panel shows the clock".into())
+        }
+        command => carousel.command(command),
+    };
+    let changed = outcome.is_ok();
+    if wait && changed {
+        carousel.flash.as_mut().unwrap().reply = Some(reply);
+    } else {
+        let _ = reply.send(outcome);
+    }
+    changed
 }
 
 /// Saves `frame`, the one on the panel, to `path` as a JPEG.
@@ -311,7 +338,7 @@ struct Carousel {
     /// A message from `cooler-lcd flash` and when it was first drawn. Its
     /// time runs from then, so one sent while the panel is unplugged still
     /// gets its full turn once it's back.
-    flash: Option<(Box<dyn Screen>, Option<Instant>)>,
+    flash: Option<Overlay>,
     /// A countdown from `cooler-lcd timer` and when it's up.
     timer: Option<(Box<dyn Screen>, DateTime<Local>)>,
     screens: Vec<(String, Box<dyn Screen>)>,
@@ -330,6 +357,50 @@ struct Carousel {
     index: usize,
     shown_at: Instant,
     rotate: Duration,
+}
+
+/// An overlay's lifetime starts after USB accepts a frame. A superseded
+/// --wait command must be answered too, even if it never reached the panel.
+struct Overlay {
+    screen: Box<dyn Screen>,
+    duration: Option<Duration>,
+    drawn_at: Option<Instant>,
+    receipt: Receipt,
+    reply: Option<std::sync::mpsc::Sender<Result<String, String>>>,
+}
+
+impl Overlay {
+    /// Notice delivery promptly, then wake at the exact expiry even when
+    /// the underlying still screen only updates once a second.
+    fn wake(&self) -> Option<Instant> {
+        match self.drawn_at {
+            None => Some(Instant::now() + Duration::from_millis(50)),
+            Some(at) => self.duration.and_then(|length| at.checked_add(length)),
+        }
+    }
+
+    fn new(screen: Box<dyn Screen>, duration: Option<Duration>) -> Self {
+        Self {
+            screen,
+            duration,
+            drawn_at: None,
+            receipt: Receipt::default(),
+            reply: None,
+        }
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let outcome = if self.receipt.sent_at().is_some() {
+                Ok(String::new())
+            } else {
+                Err("content replaced or dismissed before it was shown".into())
+            };
+            let _ = reply.send(outcome);
+        }
+    }
 }
 
 impl Carousel {
@@ -466,6 +537,10 @@ impl Carousel {
     /// for the user, which may be empty.
     fn command(&mut self, command: Command) -> Result<String, String> {
         match command {
+            Command::Next if self.flashing() => {
+                self.flash = None;
+                self.shown_at = Instant::now();
+            }
             Command::Next | Command::Show(_) if self.timing() && !self.timer_up() => {
                 return Err("a timer is running; `cooler-lcd timer stop` cancels it".into());
             }
@@ -486,7 +561,17 @@ impl Carousel {
                     false => self.turn_on(&name),
                 };
             }
-            Command::Flash(text) => self.flash = Some((screens::flash(text), None)),
+            Command::Flash(text) => {
+                self.flash = Some(Overlay::new(screens::flash(text), Some(self.rotate)))
+            }
+            Command::Content(content) => {
+                let duration = match content.lifetime {
+                    content::Lifetime::Rotation => Some(self.rotate),
+                    content::Lifetime::For(length) => Some(length),
+                    content::Lifetime::UntilNext => None,
+                };
+                self.flash = Some(Overlay::new(content.screen(), duration));
+            }
             Command::Snapshot(_) => return Err("snapshots are taken by the frame loop".into()),
             Command::Timer(length) => {
                 let ends = Local::now() + TimeDelta::from_std(length).map_err(|e| e.to_string())?;
@@ -586,23 +671,29 @@ impl Carousel {
 
     /// Takes down a flash whose time is up. Returns true if it did.
     fn expire_flash(&mut self) -> bool {
-        if self
-            .flash
-            .as_ref()
-            .is_none_or(|(_, drawn_at)| drawn_at.is_none_or(|t| t.elapsed() < self.rotate))
-        {
-            return false;
+        let expired = self.flash.as_ref().is_some_and(|f| {
+            f.duration
+                .zip(f.drawn_at)
+                .is_some_and(|(length, at)| at.elapsed() >= length)
+        });
+        if expired {
+            self.flash = None;
+            self.shown_at = Instant::now();
         }
-        self.flash = None;
-        self.shown_at = Instant::now();
-        true
+        expired
     }
 
-    /// Notes that a frame of the flash went to the panel, starting its time
-    /// if this was the first.
+    /// Observe actual USB delivery, rather than counting time spent queued
+    /// in the sender. Redraws and keepalives share the same receipt.
     fn flash_drawn(&mut self) {
-        if let Some((_, drawn_at @ None)) = &mut self.flash {
-            *drawn_at = Some(Instant::now());
+        if let Some(flash) = &mut self.flash
+            && flash.drawn_at.is_none()
+            && let Some(at) = flash.receipt.sent_at()
+        {
+            flash.drawn_at = Some(at);
+            if let Some(reply) = flash.reply.take() {
+                let _ = reply.send(Ok(String::new()));
+            }
         }
     }
 
@@ -611,8 +702,8 @@ impl Carousel {
     }
 
     fn current(&mut self) -> &mut Box<dyn Screen> {
-        if let Some((screen, _)) = &mut self.flash {
-            return screen;
+        if let Some(flash) = &mut self.flash {
+            return &mut flash.screen;
         }
         match &mut self.timer {
             Some((screen, _)) => screen,
@@ -769,11 +860,12 @@ mod tests {
         // Not yet drawn (the panel is unplugged, say), it doesn't run out.
         assert!(!tick(&mut c));
         assert!(c.flashing());
+        c.flash.as_ref().unwrap().receipt.mark_sent();
         c.flash_drawn();
         assert!(!tick(&mut c));
         // Later frames don't restart its time.
-        if let Some((_, Some(drawn_at))) = &mut c.flash {
-            *drawn_at -= c.rotate;
+        if let Some(flash) = &mut c.flash {
+            *flash.drawn_at.as_mut().unwrap() -= c.rotate;
         }
         c.flash_drawn();
         assert!(tick(&mut c));
@@ -933,5 +1025,82 @@ mod tests {
         present.set(false);
         c.command(Command::Off("s0".into())).unwrap();
         assert_eq!(c.index, 1);
+    }
+
+    fn content(lifetime: content::Lifetime) -> Command {
+        Command::Content(content::Prepared {
+            visual: content::Visual::Flash {
+                message: "script message".into(),
+                color: None,
+                icon: None,
+            },
+            lifetime,
+            wait: false,
+        })
+    }
+
+    #[test]
+    fn custom_duration_starts_after_delivery_and_redraws_dont_restart_it() {
+        let (mut c, _) = carousel(2);
+        let length = Duration::from_secs(30);
+        c.command(content(content::Lifetime::For(length))).unwrap();
+        assert_eq!(c.flash.as_ref().unwrap().duration, Some(length));
+        c.shown_at -= c.rotate * 5;
+        c.flash_drawn();
+        assert!(!tick(&mut c), "unplugged content has not started its time");
+        assert!(c.flash.as_ref().unwrap().drawn_at.is_none());
+        c.flash.as_ref().unwrap().receipt.mark_sent();
+        c.flash_drawn();
+        *c.flash.as_mut().unwrap().drawn_at.as_mut().unwrap() -= length;
+        c.flash_drawn();
+        assert!(tick(&mut c));
+        assert!(!c.flashing());
+        assert!(c.shown_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn held_content_can_be_dismissed_while_away_without_canceling_a_timer() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        c.flash.as_ref().unwrap().receipt.mark_sent();
+        c.flash_drawn();
+        *c.flash.as_mut().unwrap().drawn_at.as_mut().unwrap() -= Duration::from_secs(86400);
+        assert!(!tick(&mut c));
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let request = Request {
+            command: Command::Next,
+            reply,
+            expires: None,
+        };
+        assert!(handle_request(&mut c, request, true, &[]));
+        assert!(outcome.recv().unwrap().is_ok());
+        assert!(!c.flashing());
+        assert!(
+            c.timing(),
+            "next dismisses the overlay and reveals the running timer"
+        );
+        assert!(c.command(Command::Next).is_err());
+    }
+
+    #[test]
+    fn expired_requests_dont_replace_content_and_waiters_get_dismissal_errors() {
+        let (mut c, _) = carousel(2);
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        let receipt = c.flash.as_ref().unwrap().receipt.clone();
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let request = Request {
+            command: Command::Next,
+            reply,
+            expires: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(!handle_request(&mut c, request, false, &[]));
+        assert!(outcome.recv().is_err());
+        assert!(c.flashing());
+        let (reply, outcome) = std::sync::mpsc::channel();
+        c.flash.as_mut().unwrap().reply = Some(reply);
+        c.command(Command::Next).unwrap();
+        assert!(outcome.recv().unwrap().unwrap_err().contains("dismissed"));
+        assert!(receipt.sent_at().is_none());
     }
 }

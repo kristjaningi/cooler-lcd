@@ -102,7 +102,7 @@ fn read_colors() -> Result<toml::Table> {
 }
 
 /// Parses `#rrggbb` (the `#` is optional).
-fn parse_hex(s: &str) -> Option<Rgb> {
+pub fn parse_hex(s: &str) -> Option<Rgb> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

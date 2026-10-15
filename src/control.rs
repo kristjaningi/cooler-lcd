@@ -7,10 +7,12 @@
 //!   cooler-lcd off NAME      take a screen out of the rotation
 //!   cooler-lcd toggle NAME   one or the other
 //!   cooler-lcd flash TEXT    show a message for one rotation
+//!   cooler-lcd image FILE    show a scaled/cropped local image
 //!   cooler-lcd snapshot FILE save what the panel shows as a JPEG
 //!   cooler-lcd timer 25m     count down on the panel; `timer stop` cancels
 //!
-//! One command per connection, one line each way: the command, then `ok`
+//! One command per connection, one line each way: a legacy command or JSON
+//! content submission, then `ok`
 //! (with a message for the user after a space, if there is one) or
 //! `error: ...`.
 
@@ -26,11 +28,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::content::{Prepared, Submission};
 use crate::log::Log;
 
 /// Verbs accepted on the command line and the socket.
 pub const VERBS: &[&str] = &[
-    "next", "show", "on", "off", "toggle", "flash", "snapshot", "timer",
+    "next", "show", "on", "off", "toggle", "flash", "image", "snapshot", "timer",
 ];
 /// Long enough for the frame loop to get to it (at most a tick).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -38,7 +41,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest command accepted, in bytes.
-const MAX_LINE: usize = 1024;
+const MAX_LINE: usize = 16 * 1024;
 /// The longest timer accepted.
 const MAX_TIMER: Duration = Duration::from_secs(24 * 60 * 60);
 /// Connections served at once; more are turned away.
@@ -54,6 +57,8 @@ pub enum Command {
     Off(String),
     Toggle(String),
     Flash(String),
+    /// A fully prepared image or styled message; no I/O on the frame loop.
+    Content(Prepared),
     /// Where to save the frame on the panel; an absolute path, since the
     /// service doesn't share the client's working directory.
     Snapshot(PathBuf),
@@ -65,12 +70,13 @@ pub enum Command {
 
 /// A command from the socket, with where to send its outcome. Once
 /// `expires` has passed the client has been told there was no answer, so
-/// the command is dropped instead of carried out late.
+/// the command is dropped instead of carried out late. --wait submissions
+/// have no deadline and are answered after delivery, replacement or dismissal.
 pub struct Request {
     pub command: Command,
     /// Ok with a message for the user (maybe empty), or why it failed.
     pub reply: mpsc::Sender<Result<String, String>>,
-    pub expires: Instant,
+    pub expires: Option<Instant>,
 }
 
 /// The per-user runtime directory, which only this user can get into.
@@ -123,7 +129,9 @@ pub fn listen(lock: File) -> Result<mpsc::Receiver<Request>> {
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-    let (tx, rx) = mpsc::channel();
+    // Requests can own a full image; bound retained frames if the frame
+    // loop stalls instead of accumulating expired submissions.
+    let (tx, rx) = mpsc::sync_channel(MAX_CLIENTS);
     thread::spawn(move || {
         let _lock = lock;
         let active = Arc::new(AtomicUsize::new(0));
@@ -169,28 +177,38 @@ fn refuse(stream: &UnixStream, why: &str) {
     let _ = (&*stream).write_all(format!("error: {why}\n").as_bytes());
 }
 
-fn serve(stream: UnixStream, requests: &mpsc::Sender<Request>) {
+fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let outcome = read_command(&stream, Instant::now() + READ_DEADLINE)
         .and_then(|line| parse(&line))
         .and_then(|command| {
+            let wait = matches!(&command, Command::Content(c) if c.wait);
             let (reply, outcome) = mpsc::channel();
-            let expires = Instant::now() + REPLY_TIMEOUT;
+            let expires = (!wait).then(|| Instant::now() + REPLY_TIMEOUT);
             requests
-                .send(Request {
+                .try_send(Request {
                     command,
                     reply,
                     expires,
                 })
-                .map_err(|_| "shutting down".to_string())?;
-            outcome
-                .recv_timeout(REPLY_TIMEOUT)
-                .unwrap_or_else(|_| Err("no answer from the frame loop; not carried out".into()))
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Full(_) => "frame loop busy, try again".to_string(),
+                    mpsc::TrySendError::Disconnected(_) => "shutting down".to_string(),
+                })?;
+            if wait {
+                outcome
+                    .recv()
+                    .unwrap_or_else(|_| Err("service stopped before the content was shown".into()))
+            } else {
+                outcome.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| {
+                    Err("no answer from the frame loop; not carried out".into())
+                })
+            }
         });
     let reply = match outcome {
         Ok(message) if message.is_empty() => "ok\n".to_string(),
         Ok(message) => format!("ok {message}\n"),
-        Err(e) => format!("error: {e}\n"),
+        Err(e) => format!("error: {}\n", e.replace(['\n', '\r'], " ")),
     };
     let _ = (&stream).write_all(reply.as_bytes());
 }
@@ -231,6 +249,13 @@ fn read_command(mut stream: &UnixStream, deadline: Instant) -> Result<String, St
 
 fn parse(line: &str) -> Result<Command, String> {
     let line = line.trim();
+    if line.starts_with('{') {
+        return serde_json::from_str::<Submission>(line)
+            .map_err(|e| format!("invalid content request: {e}"))?
+            .prepare()
+            .map(Command::Content)
+            .map_err(|e| format!("{e:#}"));
+    }
     let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
     let rest = rest.trim();
     match (verb, rest) {
@@ -239,7 +264,9 @@ fn parse(line: &str) -> Result<Command, String> {
         ("on", name) if !name.is_empty() => Ok(Command::On(name.into())),
         ("off", name) if !name.is_empty() => Ok(Command::Off(name.into())),
         ("toggle", name) if !name.is_empty() => Ok(Command::Toggle(name.into())),
-        ("flash", text) if !text.is_empty() => Ok(Command::Flash(text.into())),
+        ("flash", text) if !text.is_empty() && text.len() <= 1024 => {
+            Ok(Command::Flash(text.into()))
+        }
         ("snapshot", path) if Path::new(path).is_absolute() => Ok(Command::Snapshot(path.into())),
         ("timer", "stop") => Ok(Command::TimerStop),
         ("timer", length) if !length.is_empty() => parse_length(length).map(Command::Timer),
@@ -252,7 +279,7 @@ fn parse(line: &str) -> Result<Command, String> {
 
 /// A timer's length, like `25m`, `1h30m`, `90s` or a bare `25` for
 /// minutes, from a second up to `MAX_TIMER`.
-fn parse_length(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_length(s: &str) -> Result<Duration, String> {
     let bad = || format!("expected a length like 25m, 1h30m or 90s (got {s:?})");
     let s: String = s
         .chars()
@@ -295,14 +322,23 @@ fn parse_length(s: &str) -> Result<Duration, String> {
     Ok(length)
 }
 
-/// Sends one command line to the running service and returns its message
-/// for the user, if any.
-pub fn send(line: &str) -> Result<String> {
-    // Newlines would end the command early; a message is one line.
-    let line = line.replace(['\n', '\r'], " ");
-    if line.len() > MAX_LINE {
-        bail!("command too long (over {MAX_LINE} bytes)");
-    }
+/// Sends argv to the running service, preserving quoted content via JSON.
+pub fn send(args: &[String]) -> Result<String> {
+    let verb = args.first().context("missing command")?;
+    let (line, wait, image) = if matches!(verb.as_str(), "flash" | "image") {
+        let submission = Submission::from_args(args)?;
+        (
+            serde_json::to_string(&submission)?,
+            submission.options.wait,
+            verb == "image",
+        )
+    } else if verb == "snapshot" && args.len() > 1 {
+        let path = std::path::absolute(args[1..].join(" "))?;
+        (format!("snapshot {}", path.display()), false, false)
+    } else {
+        (args.join(" ").replace(['\n', '\r'], " "), false, false)
+    };
+    ensure_line(&line)?;
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         anyhow!(
@@ -310,10 +346,33 @@ pub fn send(line: &str) -> Result<String> {
             path.display()
         )
     })?;
-    stream.set_read_timeout(Some(REPLY_TIMEOUT + READ_DEADLINE))?;
+    // Image preparation is done before enqueueing. Explicit --wait has no
+    // display deadline: an unplugged panel can come back much later.
+    let timeout = REPLY_TIMEOUT
+        + READ_DEADLINE
+        + if image {
+            Duration::from_secs(30)
+        } else {
+            Duration::ZERO
+        };
+    stream.set_read_timeout((!wait).then_some(timeout))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.write_all(format!("{line}\n").as_bytes())?;
     let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply)?;
+    ensure_reply(BufReader::new(&stream).read_line(&mut reply)?, &reply)
+}
+
+fn ensure_line(line: &str) -> Result<()> {
+    if line.len() > MAX_LINE {
+        bail!("command too long (over {MAX_LINE} bytes)");
+    }
+    Ok(())
+}
+
+fn ensure_reply(bytes: usize, reply: &str) -> Result<String> {
+    if bytes == 0 {
+        bail!("service disconnected before replying");
+    }
     let reply = reply.trim();
     match reply.strip_prefix("ok") {
         Some(message) if message.is_empty() || message.starts_with(' ') => {
@@ -417,5 +476,140 @@ mod tests {
         drop(held);
         assert!(lock_in(&dir).is_ok(), "free again once the first is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn carousel() -> crate::Carousel {
+        crate::Carousel::with_screens(
+            vec![(
+                "dashboard".into(),
+                crate::screens::flash("underneath".into()),
+            )],
+            Duration::from_secs(15),
+        )
+    }
+
+    #[test]
+    fn wait_replies_after_delivery_and_reports_replacement_over_the_socket() {
+        let submission =
+            Submission::from_args(&["flash", "hello", "--wait", "--until-next"].map(String::from))
+                .unwrap();
+        let line = serde_json::to_string(&submission).unwrap();
+        for deliver in [false, true] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+            let worker = thread::spawn(move || serve(server, &tx));
+            client.write_all(format!("{line}\n").as_bytes()).unwrap();
+            let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                request.expires.is_none(),
+                "offline waits must not expire in the queue"
+            );
+            let mut carousel = carousel();
+            assert!(crate::handle_request(&mut carousel, request, false, &[]));
+            let mut reply = String::new();
+            let mut client = BufReader::new(client);
+            let error = client.read_line(&mut reply).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut
+            ));
+            if deliver {
+                carousel.flash.as_ref().unwrap().receipt.mark_sent();
+                carousel.flash_drawn();
+            } else {
+                carousel
+                    .command(Command::Flash("replacement".into()))
+                    .unwrap();
+            }
+            client
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.read_line(&mut reply).unwrap();
+            if deliver {
+                assert_eq!(reply, "ok\n");
+            } else {
+                assert!(reply.contains("replaced or dismissed"), "{reply}");
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_images_are_rejected_before_the_frame_loop() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+        let worker = thread::spawn(move || serve(server, &tx));
+        let submission =
+            Submission::from_args(&["image", "/nonexistent/cooler-lcd.png"].map(String::from))
+                .unwrap();
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&submission).unwrap()).as_bytes())
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert!(reply.starts_with("error: opening /nonexistent/"), "{reply}");
+        assert!(requests.try_recv().is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn queued_image_is_already_decoded_and_survives_source_removal() {
+        let path =
+            std::env::temp_dir().join(format!("cooler-lcd-push image-{}.png", std::process::id()));
+        let mut original = tiny_skia::Pixmap::new(16, 16).unwrap();
+        original.fill(tiny_skia::Color::from_rgba8(20, 180, 60, 255));
+        original.save_png(&path).unwrap();
+        let submission = Submission::from_args(&[
+            "image".to_string(),
+            path.to_string_lossy().into_owned(),
+            "--for".into(),
+            "30s".into(),
+        ])
+        .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
+        let worker = thread::spawn(move || serve(server, &tx));
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&submission).unwrap()).as_bytes())
+            .unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut carousel = carousel();
+        assert!(crate::handle_request(&mut carousel, request, false, &[]));
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert_eq!(reply, "ok\n", "normal submission acknowledges acceptance");
+        let theme = crate::theme::Theme::fallback();
+        let screen = carousel.current();
+        screen.update(chrono::Local::now());
+        let mut px = tiny_skia::Pixmap::new(480, 480).unwrap();
+        screen.draw(&mut px, &theme);
+        assert_eq!(px.pixel(240, 240).unwrap().green(), 180);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_refuses_content_without_retaining_more_frames() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, _requests) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || serve(server, &tx));
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(b"flash hello\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert!(reply.contains("busy"));
+        worker.join().unwrap();
     }
 }
