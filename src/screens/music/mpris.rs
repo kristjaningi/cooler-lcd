@@ -91,6 +91,9 @@ pub struct State {
     pub art: Option<Arc<Pixmap>>,
     /// Whether the first poll, and any visible artwork, are done.
     pub ready: bool,
+    /// Whether a poll has been accepted: until then there's no telling
+    /// whether anything's playing, so not ready, art or no art.
+    polled: bool,
     playing_at: Option<Instant>,
     activity: Activity,
     worker: Option<Thread>,
@@ -146,6 +149,7 @@ impl State {
             self.playing_at = Some(Instant::now());
         }
         self.playback = playback;
+        self.polled = true;
         self.refresh_art();
         if self.next_art().is_some()
             && let Some(worker) = &self.art_worker
@@ -159,11 +163,12 @@ impl State {
             (Some(key), Some((had, Ok(px)))) if key == had => Some(px.clone()),
             _ => None,
         };
-        self.ready |= self.desired.is_none()
-            || self
-                .cached
-                .as_ref()
-                .is_some_and(|(key, _)| Some(key) == self.desired.as_ref());
+        self.ready |= self.polled
+            && (self.desired.is_none()
+                || self
+                    .cached
+                    .as_ref()
+                    .is_some_and(|(key, _)| Some(key) == self.desired.as_ref()));
     }
 
     fn next_art(&self) -> Option<ArtKey> {
@@ -735,6 +740,27 @@ mod tests {
         assert!(!load_next_art(&shared, |_| panic!(
             "suspended screen must not fetch"
         )));
+    }
+
+    #[test]
+    fn not_ready_until_the_first_poll() {
+        // As `--preview` starts it: in view before the poller has answered.
+        let shared = visible();
+        assert!(!shared.lock().unwrap().ready, "no poll yet");
+        publish(&shared, None);
+        assert!(
+            shared.lock().unwrap().ready,
+            "nothing playing, no art to wait for"
+        );
+
+        // A track with art waits for the cover too.
+        let shared = visible();
+        publish(&shared, Some(track("A", "https://example.test/a.jpg")));
+        assert!(!shared.lock().unwrap().ready);
+        assert!(load_next_art(&shared, |_| Ok(
+            Pixmap::new(480, 480).unwrap()
+        )));
+        assert!(shared.lock().unwrap().ready);
     }
 
     #[test]
