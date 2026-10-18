@@ -127,6 +127,7 @@ fn main() -> Result<()> {
 
     if let Some(path) = args.preview {
         let screen = carousel.current();
+        screen.activity(true, true);
         screen.update(Local::now());
         // Give background fetchers (network data) a moment to deliver.
         for _ in 0..50 {
@@ -191,6 +192,7 @@ fn main() -> Result<()> {
 
         // Nothing to draw for until the sender has a panel; redraw once it does.
         if !sender.connected() {
+            carousel.activity(false);
             dirty = true;
             sleep(OFFLINE_TICK);
             continue;
@@ -247,6 +249,7 @@ fn main() -> Result<()> {
             showed_away = show_away;
             dirty = true;
         }
+        carousel.activity(!away);
         let rotation = carousel.progress().filter(|_| config.rotate_bar);
         let screen = if show_away {
             &mut away_screen
@@ -528,8 +531,15 @@ impl Carousel {
         for alert in self.screens[i].1.alerts(Local::now()) {
             self.seen[i].insert(alert, now);
         }
+        // While off, its workers were parked and what it knows is stale.
+        // Waking them now is enough: the next tick sets the real activity.
+        let screen = &mut self.screens[i].1;
+        if !screen.present() {
+            screen.activity(true, false);
+            screen.refresh();
+        }
         // With nothing to show yet, it waits for its turn once it has.
-        if !self.screens[i].1.present() {
+        if !screen.present() {
             return Ok(format!("{name} on, shown once it has something to show"));
         }
         // Not from under a timer; it comes up after.
@@ -608,6 +618,16 @@ impl Carousel {
 
     fn flashing(&self) -> bool {
         self.flash.is_some()
+    }
+
+    /// Pass the carousel's lifecycle to background workers without making
+    /// them infer visibility from a delayed heartbeat.
+    fn activity(&mut self, active: bool) {
+        let uncovered = self.flash.is_none() && self.timer.is_none();
+        for (i, (_, screen)) in self.screens.iter_mut().enumerate() {
+            let visible = active && uncovered && i == self.index;
+            screen.activity(active && (self.on[i] || visible), visible);
+        }
     }
 
     fn current(&mut self) -> &mut Box<dyn Screen> {
@@ -931,5 +951,78 @@ mod tests {
         present.set(false);
         c.command(Command::Off("s0".into())).unwrap();
         assert_eq!(c.index, 1);
+    }
+
+    #[test]
+    fn workers_follow_visibility_off_away_and_explicit_show() {
+        struct Activity(Rc<Cell<(bool, bool)>>);
+        impl Screen for Activity {
+            fn update(&mut self, _: DateTime<Local>) -> bool {
+                false
+            }
+            fn draw(&self, _: &mut Pixmap, _: &Theme) {}
+            fn activity(&mut self, active: bool, visible: bool) {
+                self.0.set((active, visible));
+            }
+        }
+        let (mut c, _) = carousel(2);
+        let states = [
+            Rc::new(Cell::new((false, false))),
+            Rc::new(Cell::new((false, false))),
+        ];
+        for (i, state) in states.iter().enumerate() {
+            c.screens[i].1 = Box::new(Activity(state.clone()));
+        }
+        c.activity(true);
+        assert_eq!(states[0].get(), (true, true));
+        assert_eq!(states[1].get(), (true, false));
+        c.command(Command::Off("s1".into())).unwrap();
+        c.activity(true);
+        assert_eq!(states[1].get(), (false, false));
+        c.command(Command::Show("s1".into())).unwrap();
+        c.activity(true);
+        assert_eq!(
+            states[1].get(),
+            (true, true),
+            "show overrides off for its turn"
+        );
+        c.command(Command::Flash("hello".into())).unwrap();
+        c.activity(true);
+        assert_eq!(states[0].get(), (true, false));
+        assert_eq!(states[1].get(), (false, false));
+        c.activity(false);
+        assert!(
+            states.iter().all(|s| s.get() == (false, false)),
+            "away/offline suspends everyone"
+        );
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        c.activity(true);
+        assert_eq!(states[0].get(), (true, false));
+        assert_eq!(states[1].get(), (false, false));
+    }
+
+    #[test]
+    fn turning_on_a_parked_screen_refreshes_it_before_deciding() {
+        /// Knows it has something to show only after a refresh.
+        struct Parked(Rc<Cell<bool>>);
+        impl Screen for Parked {
+            fn update(&mut self, _: DateTime<Local>) -> bool {
+                false
+            }
+            fn draw(&self, _: &mut Pixmap, _: &Theme) {}
+            fn present(&self) -> bool {
+                self.0.get()
+            }
+            fn refresh(&mut self) {
+                self.0.set(true);
+            }
+        }
+        for command in [Command::On("s1".into()), Command::Toggle("s1".into())] {
+            let (mut c, _) = carousel(2);
+            c.screens[1].1 = Box::new(Parked(Rc::default()));
+            c.command(Command::Off("s1".into())).unwrap();
+            assert_eq!(c.command(command).unwrap(), "s1 on");
+            assert_eq!(c.index, 1, "shown right away");
+        }
     }
 }

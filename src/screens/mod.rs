@@ -24,6 +24,11 @@ use crate::config::Config;
 use crate::theme::Theme;
 
 pub trait Screen {
+    /// Background discovery is allowed while active; expensive preparation
+    /// belongs to the visible screen. Disabled, away and offline screens
+    /// are inactive, except an explicitly shown screen that's switched off.
+    fn activity(&mut self, _active: bool, _visible: bool) {}
+
     /// Refreshes the screen's data. Returns true when the picture changed and
     /// needs redrawing. Called every `interval()` while the screen is
     /// visible, and right away when it comes up.
@@ -63,6 +68,11 @@ pub trait Screen {
     fn present(&self) -> bool {
         true
     }
+
+    /// Brings what `present` goes by up to date now, for a screen whose
+    /// background work was stopped while it was off. Called on the frame
+    /// loop by `on` and `toggle`, so it may block briefly, but only then.
+    fn refresh(&mut self) {}
 
     /// The screen's own progress, 0..=1, for the bar along the bottom
     /// edge to show in place of the countdown to the next screen. Asked on

@@ -5,6 +5,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -20,6 +21,9 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 pub struct Theme {
+    /// Cache identity, including font reloads even when an allocator reuses
+    /// the old font's address while a screen is hidden.
+    pub revision: u64,
     pub background: Rgb,
     pub surface: Rgb,
     pub foreground: Rgb,
@@ -79,7 +83,9 @@ impl Theme {
                 .and_then(parse_hex)
                 .unwrap_or(fallback)
         };
+        static REVISION: AtomicU64 = AtomicU64::new(1);
         Self {
+            revision: REVISION.fetch_add(1, Ordering::Relaxed),
             background: color("background", Rgb(0x1a, 0x1b, 0x26)),
             surface: color("lighter_background", Rgb(0x24, 0x28, 0x3b)),
             foreground: color("bright_foreground", Rgb(0xc0, 0xca, 0xf5)),

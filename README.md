@@ -196,16 +196,23 @@ defaults are used.
   slowing down on HTTP 429. ([adsb.lol](https://adsb.lol) serves the same
   format but kept rate limiting it.) Positions are dead reckoned
   between polls, so blips glide at the 15 fps animation rate. The static
-  scope, rings and map are drawn once per theme. Coastline from Natural
+  scope, rings and map are drawn once per theme. Text layouts and glyph
+  coverage are cached with bounded memory; moving labels use eight subpixel
+  phases per axis (at most 1/16 pixel rounding). Coastline from Natural
   Earth, runways from OurAirports (`src/screens/radar/`).
 - **Music:** players are found on the session bus over MPRIS, polled
   with `busctl` (one call for the list of players, one for each player's
   state) every 2 s while the screen is up and every 5 s while it isn't,
-  about 0.1% of a core. A playing player wins, then a paused one. The
-  track's position is run on between polls, so the bar keeps moving. Album
+  about 0.1% of a core. Polling pauses while music is switched off, the
+  desktop is away, or the panel is disconnected. A playing player wins,
+  then a paused one. The track's position is run on between polls, so the
+  bar keeps moving. Album
   art is read from wherever the player points (a file, an inline `data:`
-  URL, or the web, capped at 10 MB and 4096 pixels a side), then scaled
-  and shaded once per track (`src/screens/music/`).
+  URL, or the web, capped at 10 MB and 2048 pixels a side), then scaled
+  and shaded on a separate worker only while music is visible, so slow art
+  never delays playback updates. The cache follows the player, track and
+  local file revision, including players that reuse a cover path
+  (`src/screens/music/`).
 - **Away:** while the Hyprland session is locked or every monitor is off,
   a dim clock replaces the screens, which stop updating, so the radar stops
   fetching and plan usage isn't on display. Checked every 2 s over
@@ -223,6 +230,7 @@ cargo run --release                                          # drive the screen
 cargo run --release -- --preview out.jpg                     # render one frame to a file
 cargo run --release -- --screen dashboard --preview out.jpg  # preview a specific screen
 cargo test                                                   # unit tests
+cargo test --release radar_render_benchmark -- --ignored --nocapture # render timings
 ```
 
 Only one program can use the screen at a time, so stop the service (or TRCC,
