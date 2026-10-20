@@ -141,6 +141,16 @@ fn lock_in(dir: &Path) -> Result<File> {
 }
 
 fn listen(path: &Path) -> Result<mpsc::Receiver<Request>> {
+    listen_with(path, |_| {})
+}
+
+/// `listen`, calling `before_serving` on each connection's thread with
+/// the connection's index in the order they were accepted, before it's
+/// served: lets tests hold one back.
+fn listen_with(
+    path: &Path,
+    before_serving: impl Fn(usize) + Send + Sync + 'static,
+) -> Result<mpsc::Receiver<Request>> {
     // Left over from a previous run that didn't get to clean up.
     let _ = std::fs::remove_file(path);
     let listener =
@@ -149,7 +159,9 @@ fn listen(path: &Path) -> Result<mpsc::Receiver<Request>> {
     // Requests can own a full image; bound retained frames if the frame
     // loop stalls instead of accumulating expired submissions.
     let (tx, rx) = mpsc::sync_channel(MAX_CLIENTS);
+    let before_serving = Arc::new(before_serving);
     thread::spawn(move || {
+        let mut index = 0;
         let active = Arc::new(AtomicUsize::new(0));
         let mut log = Log::default();
         for stream in listener.incoming() {
@@ -170,8 +182,11 @@ fn listen(path: &Path) -> Result<mpsc::Receiver<Request>> {
             // only get to run after a later one's.
             let (accepted, order) = (Instant::now(), next_order());
             let (tx, slot) = (tx.clone(), Slot(active.clone()));
+            let (before_serving, i) = (before_serving.clone(), index);
+            index += 1;
             let spawned = thread::Builder::new().spawn(move || {
                 let _slot = slot;
+                before_serving(i);
                 serve(stream, &tx, accepted, order);
             });
             if let Err(e) = spawned {
@@ -617,9 +632,18 @@ mod tests {
     #[test]
     fn connections_keep_the_order_they_were_accepted_in() {
         let dir = runtime("order");
-        let (_lock, requests) = start_in(&dir).unwrap();
-        let requests = requests.unwrap();
         let socket = dir.join("cooler-lcd.sock");
+        // The first connection of each pair has its thread held back until
+        // the second's command is carried out, so it starts after it. The
+        // wait is bounded, so a failing test can't hang it.
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let requests = listen_with(&socket, move |i| {
+            if i % 2 == 0 {
+                let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+        })
+        .unwrap();
         let connect = || {
             let client = UnixStream::connect(&socket).unwrap();
             client
@@ -640,9 +664,10 @@ mod tests {
             carousel
                 .command(Command::Content(Prepared::message("up".into())))
                 .unwrap();
-            // Accepted first, but slow to send its content.
+            // Accepted first, but its thread starts last.
             let mut slow = connect();
             let mut quick = connect();
+            slow.write_all(b"flash older\n").unwrap();
             quick.write_all(format!("{newer}\n").as_bytes()).unwrap();
             let request = next();
             let newer_order = request.order;
@@ -654,7 +679,7 @@ mod tests {
                 &[]
             ));
             assert_eq!(reply(quick), "ok\n");
-            slow.write_all(b"flash older\n").unwrap();
+            open.send(()).unwrap();
             let request = next();
             assert!(request.order < newer_order, "numbered when accepted");
             assert!(!crate::handle_request(
