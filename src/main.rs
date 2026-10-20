@@ -138,12 +138,7 @@ fn main() -> Result<()> {
         log.error(format!("{e:#}; using defaults"));
         Config::default()
     });
-    // A screen asked for by name is shown even if the config has it off.
-    let (names, off) = match args.screen {
-        Some(name) => (vec![name], Vec::new()),
-        None => (config.screens.clone(), config.off.clone()),
-    };
-    let mut carousel = Carousel::new(&names, &off, &config, &mut log)?;
+    let mut carousel = Carousel::new(args.screen, &config, &mut log)?;
     // The theme as loaded, and as drawn: at night a light one turns dark.
     let mut day_theme = Theme::load(false)?;
     let mut theme = day_theme.clone();
@@ -172,13 +167,16 @@ fn main() -> Result<()> {
     }
 
     // Before the sender, so a second instance exits instead of lying in
-    // wait for the panel. Without a socket the service still runs.
-    let requests = match control::lock() {
+    // wait for the panel. Without a socket the service still runs, holding
+    // on to the lock all the same.
+    let (_lock, requests) = match control::start() {
         Err(e) if e.is::<control::AlreadyRunning>() => return Err(e),
-        lock => lock.and_then(control::listen),
-    }
-    .inspect_err(|e| log.error(format!("control socket: {e:#}")))
-    .ok();
+        Err(e) => (None, Err(e)),
+        Ok((lock, requests)) => (Some(lock), requests),
+    };
+    let requests = requests
+        .inspect_err(|e| log.error(format!("control socket: {e:#}")))
+        .ok();
     let sender = Sender::spawn();
     let desktop = Desktop::spawn();
     let mut away_screen = screens::away();
@@ -399,7 +397,9 @@ fn handle_request(
         Command::Next if carousel.flashing() || carousel.timer_up() => {
             carousel.command(Command::Next)
         }
-        Command::Next | Command::Show(_) if away && !carousel.timing() => {
+        // `show` would take down a timer that's up from under the clock.
+        Command::Show(_) if away => Err("the desktop is away, so the panel shows the clock".into()),
+        Command::Next if away && !carousel.timing() => {
             Err("the desktop is away, so the panel shows the clock".into())
         }
         command => carousel.command(command),
@@ -420,8 +420,36 @@ fn handle_request(
 fn snapshot(frame: &[u8], path: &std::path::Path) -> Result<String, String> {
     let jpeg = frame.get(HEADER_LEN..).filter(|j| !j.is_empty());
     let jpeg = jpeg.ok_or("nothing on the panel yet")?;
-    std::fs::write(path, jpeg).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    write_regular(path, jpeg).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(format!("wrote {}", path.display()))
+}
+
+/// Writes `bytes` to `path`, a new or regular file, without blocking: this
+/// runs on the frame loop, where a named pipe with no reader would freeze
+/// the panel. Opening a device can have side effects, so check before
+/// opening too (as `picture::load` does).
+fn write_regular(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let not_regular = || Error::new(ErrorKind::InvalidInput, "not a regular file");
+    match std::fs::metadata(path) {
+        Ok(m) if !m.is_file() => return Err(not_regular()),
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    // O_NONBLOCK, against a pipe swapped in since the check; truncate
+    // only once it's known to be a regular file.
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    file.set_len(0)?;
+    file.write_all(bytes)
 }
 
 /// The configured screens, shown one at a time for `rotate` each. A screen
@@ -503,13 +531,56 @@ impl Drop for Overlay {
 }
 
 impl Carousel {
-    fn new(names: &[String], off: &[String], config: &Config, log: &mut Log) -> Result<Self> {
+    /// Just `screen`, which has to be one, if asked for by name; else the
+    /// configured screens.
+    fn new(screen: Option<String>, config: &Config, log: &mut Log) -> Result<Self> {
+        Self::configured(screen, config, log, |name| screens::build(name, config))
+    }
+
+    /// `new`, with the screens made by `build`. A config with none it can
+    /// show gets the defaults, as one that doesn't parse does, rather than
+    /// the service exiting (and restarting) over it.
+    fn configured(
+        screen: Option<String>,
+        config: &Config,
+        log: &mut Log,
+        mut build: impl FnMut(&str) -> Option<Box<dyn Screen>>,
+    ) -> Result<Self> {
+        let rotate = config.rotate();
+        match screen {
+            // A screen asked for by name is shown even if the config has it off.
+            Some(name) => Self::build(&[name], &[], rotate, log, build),
+            None => {
+                Self::build(&config.screens, &config.off, rotate, log, &mut build).or_else(|e| {
+                    log.error(format!("{e:#}; showing the default screens"));
+                    // None off, so the config can't take these out too.
+                    Self::build(&Config::default().screens, &[], rotate, log, build)
+                })
+            }
+        }
+    }
+
+    /// The carousel of `names`, made by `build`, with those in `off` out of
+    /// the rotation.
+    fn build(
+        names: &[String],
+        off: &[String],
+        rotate: Duration,
+        log: &mut Log,
+        mut build: impl FnMut(&str) -> Option<Box<dyn Screen>>,
+    ) -> Result<Self> {
         for name in off.iter().filter(|n| !names.contains(n)) {
             log.error(format!("off: {name:?} isn't one of the configured screens"));
         }
         let mut screens = Vec::new();
-        for name in names {
-            match screens::build(name, config) {
+        for (i, name) in names.iter().enumerate() {
+            // `on`, `off` and `show` only reach the first of a name, so a
+            // second would be a copy beyond their reach, workers and all.
+            if names[..i].contains(name) {
+                log.error(format!("screen {name:?} is listed twice; showing it once"));
+                continue;
+            }
+            match build(name) {
                 Some(s) => screens.push((name.clone(), s)),
                 None => log.error(format!(
                     "unknown screen {name:?} (available: {})",
@@ -520,7 +591,7 @@ impl Carousel {
         if screens.is_empty() {
             bail!("no usable screens configured");
         }
-        let mut carousel = Self::with_screens(screens, config.rotate());
+        let mut carousel = Self::with_screens(screens, rotate);
         carousel.on = carousel
             .screens
             .iter()
@@ -645,6 +716,7 @@ impl Carousel {
         match command {
             Command::Next if self.flashing() => {
                 self.flash = None;
+                self.taken_over = false;
                 self.shown_at = Instant::now();
             }
             Command::Next | Command::Show(_) if self.timing() && !self.timer_up() => {
@@ -800,7 +872,10 @@ impl Carousel {
                 .is_some_and(|(length, at)| at.elapsed() >= length)
         });
         if expired {
+            // A takeover it covered has had its turn hidden; alerts that
+            // came up meanwhile go next, not after another full turn.
             self.flash = None;
+            self.taken_over = false;
             self.shown_at = Instant::now();
         }
         expired
@@ -1437,5 +1512,188 @@ mod tests {
         assert!(handle_request(&mut c, &mut night(), pushed, false, &[]));
         assert!(!c.ring());
         assert!(c.flashing());
+    }
+
+    #[test]
+    fn snapshots_write_regular_files_only_and_never_block() {
+        let dir = std::env::temp_dir().join(format!("cooler-lcd-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut frame = vec![0; HEADER_LEN];
+        frame.extend_from_slice(b"\xff\xd8 jpeg \xff\xd9");
+        let jpeg = &frame[HEADER_LEN..];
+
+        let new = dir.join("new.jpg");
+        assert!(snapshot(&frame, &new).unwrap().starts_with("wrote"));
+        assert_eq!(std::fs::read(&new).unwrap(), jpeg);
+        let old = dir.join("old.jpg");
+        std::fs::write(&old, vec![b'x'; 4096]).unwrap();
+        snapshot(&frame, &old).unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), jpeg, "overwritten whole");
+        assert!(snapshot(&frame, &dir).is_err(), "a directory");
+        assert!(snapshot(&frame[..HEADER_LEN], &new).is_err(), "nothing yet");
+
+        // A pipe nobody reads, on its own thread so that a regression
+        // fails the test rather than hanging it.
+        let fifo = dir.join("pipe");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is a valid NUL-terminated pathname in our temp dir.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let (frame, path) = (frame.clone(), fifo.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(snapshot(&frame, &path));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(5));
+        if outcome.is_err() {
+            // Let a writer stuck in open or write go, then fail.
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut reader) = std::fs::File::options()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = reader.read_to_end(&mut Vec::new());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(outcome.expect("snapshot blocked on a pipe").is_err());
+    }
+
+    #[test]
+    fn show_is_refused_while_away_even_with_a_timer_up() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Timer(Duration::from_secs(60))).unwrap();
+        if let Some((_, ends)) = &mut c.timer {
+            *ends = Local::now();
+        }
+        let (show, outcome) = request(Command::Show("s1".into()), 1);
+        assert!(!handle_request(&mut c, &mut night(), show, true, &[]));
+        assert!(outcome.recv().unwrap().unwrap_err().contains("away"));
+        assert!(c.timing() && c.timer_up(), "still waiting behind the clock");
+        assert_eq!(c.index, 0);
+        // Pushed content can still be dismissed.
+        let (mut c, _) = carousel(2);
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        let (next, outcome) = request(Command::Next, 1);
+        assert!(handle_request(&mut c, &mut night(), next, true, &[]));
+        assert!(outcome.recv().unwrap().is_ok());
+        assert!(!c.flashing());
+        let (next, outcome) = request(Command::Next, 2);
+        assert!(!handle_request(&mut c, &mut night(), next, true, &[]));
+        assert!(outcome.recv().unwrap().is_err(), "nothing left to dismiss");
+    }
+
+    #[test]
+    fn an_alert_waiting_on_covered_takeover_comes_up_once_content_is_gone() {
+        for expire in [false, true] {
+            let (mut c, alerts) = carousel(3);
+            alerts[1].replace(vec!["CPU over 85°".into()]);
+            assert!(tick(&mut c));
+            assert!(c.taken_over);
+            c.command(content(content::Lifetime::For(Duration::from_secs(30))))
+                .unwrap();
+            alerts[2].replace(vec!["ICE614 squawking emergency".into()]);
+            assert!(!tick(&mut c));
+            assert_eq!(c.pending, [2]);
+            if expire {
+                c.flash.as_ref().unwrap().receipt.mark_sent();
+                c.flash_drawn();
+                *c.flash.as_mut().unwrap().drawn_at.as_mut().unwrap() -= c.rotate;
+                assert!(tick(&mut c), "expired");
+            } else {
+                c.command(Command::Next).unwrap();
+            }
+            assert!(!c.flashing());
+            assert!(tick(&mut c), "no waiting a turn behind hidden s1");
+            assert_eq!(c.index, 2);
+        }
+    }
+
+    /// Fake screens for the names `screens::build` knows, counting each made.
+    fn builder(made: &RefCell<Vec<String>>) -> impl FnMut(&str) -> Option<Box<dyn Screen>> {
+        |name| {
+            screens::NAMES.contains(&name).then(|| {
+                made.borrow_mut().push(name.into());
+                Box::new(Fake(Rc::default())) as Box<dyn Screen>
+            })
+        }
+    }
+
+    fn names(c: &Carousel) -> Vec<&str> {
+        c.screens.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn unusable_screen_lists_fall_back_to_the_defaults() {
+        let made = RefCell::default();
+        let configured = |screens: &[&str], off: &[&str]| {
+            let config = Config {
+                screens: screens.iter().map(|&s| s.into()).collect(),
+                off: off.iter().map(|&s| s.into()).collect(),
+                rotate_seconds: 42,
+                ..Config::default()
+            };
+            Carousel::configured(None, &config, &mut Log::default(), builder(&made)).unwrap()
+        };
+        for (screens, off) in [
+            (&[][..], &[][..]),
+            (&["dashbord"], &[]),
+            (&["dashbord", "usgae"], &["dashboard"]),
+        ] {
+            let c = configured(screens, off);
+            assert_eq!(names(&c), ["dashboard"], "{screens:?}");
+            assert_eq!(c.on, [true], "off can't take out the fallback");
+            assert_eq!(c.rotate, Duration::from_secs(42), "other settings kept");
+        }
+        let c = configured(&["radar", "dashbord", "usage"], &["usage"]);
+        assert_eq!(names(&c), ["radar", "usage"]);
+        assert_eq!(c.on, [true, false]);
+
+        let asked = |name: &str| {
+            Carousel::configured(
+                Some(name.into()),
+                &Config::default(),
+                &mut Log::default(),
+                builder(&made),
+            )
+        };
+        assert!(asked("bogus").is_err(), "asked for by name, so no fallback");
+        assert_eq!(names(&asked("radar").unwrap()), ["radar"]);
+    }
+
+    #[test]
+    fn a_screen_listed_twice_is_made_once() {
+        let made = RefCell::default();
+        let list = |names: &[&str]| names.iter().map(|&s| s.into()).collect::<Vec<String>>();
+        let mut c = Carousel::build(
+            &list(&["usage", "radar", "usage", "dashboard", "radar"]),
+            &list(&["radar"]),
+            Duration::from_secs(60),
+            &mut Log::default(),
+            builder(&made),
+        )
+        .unwrap();
+        assert_eq!(*made.borrow(), ["usage", "radar", "dashboard"]);
+        assert_eq!(names(&c), ["usage", "radar", "dashboard"]);
+        assert_eq!(c.on, [true, false, true]);
+        assert_eq!(
+            c.command(Command::Off("usage".into())).unwrap(),
+            "usage off"
+        );
+        assert_eq!(c.on, [false, false, true], "no copy left on");
+        assert!(
+            c.command(Command::Off("dashboard".into())).is_err(),
+            "last on"
+        );
+        assert_eq!(
+            c.command(Command::Toggle("usage".into())).unwrap(),
+            "usage on"
+        );
+        c.command(Command::On("radar".into())).unwrap();
+        assert_eq!(c.on, [true, true, true]);
+        assert_eq!(c.index, 1);
     }
 }

@@ -118,12 +118,18 @@ impl std::fmt::Display for AlreadyRunning {
 
 impl std::error::Error for AlreadyRunning {}
 
-/// Claims the one-instance lock, held for the life of the process, so two
-/// instances can't both drive the panel, nor both decide the socket is
-/// stale and remove each other's. Fails with `AlreadyRunning` if another
-/// instance holds it.
-pub fn lock() -> Result<File> {
-    lock_in(&runtime_dir()?)
+/// Claims the one-instance lock, then starts listening; requests arrive on
+/// the returned channel. The lock is for the caller to hold for the life
+/// of the process, socket or not, so two instances can't both drive the
+/// panel, nor both decide the socket is stale and remove each other's.
+/// Fails with `AlreadyRunning` if another instance holds it.
+pub fn start() -> Result<(File, Result<mpsc::Receiver<Request>>)> {
+    start_in(&runtime_dir()?)
+}
+
+fn start_in(dir: &Path) -> Result<(File, Result<mpsc::Receiver<Request>>)> {
+    let lock = lock_in(dir)?;
+    Ok((lock, listen(&dir.join("cooler-lcd.sock"))))
 }
 
 fn lock_in(dir: &Path) -> Result<File> {
@@ -134,20 +140,28 @@ fn lock_in(dir: &Path) -> Result<File> {
     Ok(lock)
 }
 
-/// Starts listening, holding on to `lock`; requests arrive on the returned
-/// channel.
-pub fn listen(lock: File) -> Result<mpsc::Receiver<Request>> {
-    let path = socket_path()?;
+fn listen(path: &Path) -> Result<mpsc::Receiver<Request>> {
+    listen_with(path, |_| {})
+}
+
+/// `listen`, calling `before_serving` on each connection's thread with
+/// the connection's index in the order they were accepted, before it's
+/// served: lets tests hold one back.
+fn listen_with(
+    path: &Path,
+    before_serving: impl Fn(usize) + Send + Sync + 'static,
+) -> Result<mpsc::Receiver<Request>> {
     // Left over from a previous run that didn't get to clean up.
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path);
     let listener =
-        UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
-    std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
     // Requests can own a full image; bound retained frames if the frame
     // loop stalls instead of accumulating expired submissions.
     let (tx, rx) = mpsc::sync_channel(MAX_CLIENTS);
+    let before_serving = Arc::new(before_serving);
     thread::spawn(move || {
-        let _lock = lock;
+        let mut index = 0;
         let active = Arc::new(AtomicUsize::new(0));
         let mut log = Log::default();
         for stream in listener.incoming() {
@@ -164,10 +178,16 @@ pub fn listen(lock: File) -> Result<mpsc::Receiver<Request>> {
                 refuse(&stream, "busy, try again");
                 continue;
             }
+            // Numbered here, not on the connection's thread, which might
+            // only get to run after a later one's.
+            let (accepted, order) = (Instant::now(), next_order());
             let (tx, slot) = (tx.clone(), Slot(active.clone()));
+            let (before_serving, i) = (before_serving.clone(), index);
+            index += 1;
             let spawned = thread::Builder::new().spawn(move || {
                 let _slot = slot;
-                serve(stream, &tx);
+                before_serving(i);
+                serve(stream, &tx, accepted, order);
             });
             if let Err(e) = spawned {
                 log.error(format!("control socket: starting a thread: {e}"));
@@ -198,9 +218,13 @@ fn reply_budget(image: bool) -> Duration {
     READ_DEADLINE + REPLY_TIMEOUT + if image { IMAGE_BUDGET } else { Duration::ZERO }
 }
 
-fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>) {
-    let accepted = Instant::now();
-    let order = ACCEPTED.fetch_add(1, Ordering::SeqCst) + 1;
+/// The next connection's place in the order they're accepted.
+fn next_order() -> u64 {
+    ACCEPTED.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Serves the connection accepted at `accepted`, `order`th of them.
+fn serve(stream: UnixStream, requests: &mpsc::SyncSender<Request>, accepted: Instant, order: u64) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let outcome = read_command(&stream, accepted + READ_DEADLINE)
         .and_then(|line| parse(&line))
@@ -584,6 +608,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fresh runtime directory of the test's own.
+    fn runtime(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cooler-lcd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_lock_is_held_without_a_socket() {
+        let dir = runtime("no-socket");
+        // Something that isn't a socket, and can't be removed as a stale one.
+        std::fs::create_dir(dir.join("cooler-lcd.sock")).unwrap();
+        let (held, listening) = start_in(&dir).unwrap();
+        assert!(listening.is_err(), "can't bind over a directory");
+        assert!(lock_in(&dir).unwrap_err().is::<AlreadyRunning>());
+        assert!(start_in(&dir).unwrap_err().is::<AlreadyRunning>());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connections_keep_the_order_they_were_accepted_in() {
+        let dir = runtime("order");
+        let socket = dir.join("cooler-lcd.sock");
+        // The first connection of each pair has its thread held back until
+        // the second's command is carried out, so it starts after it. The
+        // wait is bounded, so a failing test can't hang it.
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let requests = listen_with(&socket, move |i| {
+            if i % 2 == 0 {
+                let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+        })
+        .unwrap();
+        let connect = || {
+            let client = UnixStream::connect(&socket).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            client
+        };
+        let reply = |client: UnixStream| {
+            let mut reply = String::new();
+            BufReader::new(client).read_line(&mut reply).unwrap();
+            reply
+        };
+        let next = || requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut carousel = carousel();
+        let mut night = crate::Night::new(&crate::Config::default());
+        // Then a command that replaces content, then one that dismisses it.
+        for newer in ["flash newer", "next"] {
+            carousel
+                .command(Command::Content(Prepared::message("up".into())))
+                .unwrap();
+            // Accepted first, but its thread starts last.
+            let mut slow = connect();
+            let mut quick = connect();
+            slow.write_all(b"flash older\n").unwrap();
+            quick.write_all(format!("{newer}\n").as_bytes()).unwrap();
+            let request = next();
+            let newer_order = request.order;
+            assert!(crate::handle_request(
+                &mut carousel,
+                &mut night,
+                request,
+                false,
+                &[]
+            ));
+            assert_eq!(reply(quick), "ok\n");
+            open.send(()).unwrap();
+            let request = next();
+            assert!(request.order < newer_order, "numbered when accepted");
+            assert!(!crate::handle_request(
+                &mut carousel,
+                &mut night,
+                request,
+                false,
+                &[]
+            ));
+            assert!(reply(slow).contains("newer command came first"));
+            assert_eq!(carousel.flashing(), newer != "next");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn carousel() -> crate::Carousel {
         crate::Carousel::with_screens(
             vec![(
@@ -606,7 +717,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_millis(50)))
                 .unwrap();
             let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
-            let worker = thread::spawn(move || serve(server, &tx));
+            let worker = thread::spawn(move || serve(server, &tx, Instant::now(), next_order()));
             client.write_all(format!("{line}\n").as_bytes()).unwrap();
             let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
             assert!(
@@ -671,7 +782,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
-        let worker = thread::spawn(move || serve(server, &tx));
+        let worker = thread::spawn(move || serve(server, &tx, Instant::now(), next_order()));
         let submission =
             Submission::from_args(&["image", "/nonexistent/cooler-lcd.png"].map(String::from))
                 .unwrap();
@@ -704,7 +815,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let (tx, requests) = mpsc::sync_channel(MAX_CLIENTS);
-        let worker = thread::spawn(move || serve(server, &tx));
+        let worker = thread::spawn(move || serve(server, &tx, Instant::now(), next_order()));
         client
             .write_all(format!("{}\n", serde_json::to_string(&submission).unwrap()).as_bytes())
             .unwrap();
@@ -734,7 +845,7 @@ mod tests {
     fn a_full_queue_refuses_content_without_retaining_more_frames() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (tx, _requests) = mpsc::sync_channel(0);
-        let worker = thread::spawn(move || serve(server, &tx));
+        let worker = thread::spawn(move || serve(server, &tx, Instant::now(), next_order()));
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
