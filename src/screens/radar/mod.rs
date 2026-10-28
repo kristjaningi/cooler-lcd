@@ -94,7 +94,7 @@ pub struct Radar {
     text: RefCell<TextCache>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Status {
     Acquiring,
     Live,
@@ -1062,6 +1062,35 @@ mod tests {
         assert!((lat - 64.0).abs() < 1e-4);
         let east_nm = (lon + 22.0) * 60.0 * 64f32.to_radians().cos();
         assert!((east_nm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn link_status_follows_data_age_and_errors() {
+        // `sync(false)` reads the feed without waking its thread, so this
+        // makes no requests.
+        let mut radar = Radar::new(CENTER, 0.0);
+        let status = |radar: &mut Radar, error: Option<&str>, age: Option<Duration>| {
+            {
+                let mut feed = radar.feed.lock().unwrap();
+                feed.error = error.map(String::from);
+                feed.fetched_at = age.map(|age| Stamp::now().checked_sub(age).unwrap());
+                // Every successful fetch bumps the sequence number.
+                if age.is_some() {
+                    feed.seq += 1;
+                }
+            }
+            radar.sync(false);
+            radar.status
+        };
+        let fresh = Some(Duration::ZERO);
+        // A suspend or pause long enough for the data to expire.
+        let stale = Some(adsb::MAX_AGE + Duration::from_secs(1));
+        assert_eq!(status(&mut radar, None, None), Status::Acquiring);
+        assert_eq!(status(&mut radar, Some("x"), None), Status::NoLink);
+        assert_eq!(status(&mut radar, None, fresh), Status::Live);
+        assert_eq!(status(&mut radar, Some("x"), fresh), Status::Live);
+        assert_eq!(status(&mut radar, None, stale), Status::Acquiring);
+        assert_eq!(status(&mut radar, Some("x"), stale), Status::NoLink);
     }
 
     #[test]

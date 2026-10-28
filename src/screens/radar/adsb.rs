@@ -138,14 +138,9 @@ fn run(shared: &Shared, url: &str) {
             }
             Err(e) => {
                 backoff = match e {
-                    // Our own backoff stops growing at `MAX_BACKOFF`, but a
-                    // longer wait the server asks for is honored.
                     FetchError::RateLimited(retry_after) => {
                         pace = slow_down(pace);
-                        (backoff * 2)
-                            .max(RATE_LIMIT_BACKOFF)
-                            .min(MAX_BACKOFF)
-                            .max(retry_after.unwrap_or_default().min(MAX_RETRY_AFTER))
+                        rate_limited(backoff, retry_after)
                     }
                     FetchError::Other(_) => (backoff * 2).min(MAX_BACKOFF),
                 };
@@ -167,6 +162,15 @@ fn run(shared: &Shared, url: &str) {
         };
         thread::sleep(wait);
     }
+}
+
+/// The wait after a 429. Our own backoff stops growing at `MAX_BACKOFF`,
+/// but a longer wait the server asks for is honored.
+fn rate_limited(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    (backoff * 2)
+        .max(RATE_LIMIT_BACKOFF)
+        .min(MAX_BACKOFF)
+        .max(retry_after.unwrap_or_default().min(MAX_RETRY_AFTER))
 }
 
 fn slow_down(pace: Duration) -> Duration {
@@ -306,6 +310,23 @@ mod tests {
         }
         assert!(pace > POLL);
         assert_eq!(relax(pace), POLL);
+    }
+
+    #[test]
+    fn rate_limit_backoff_doubles_to_its_cap_but_honors_retry_after() {
+        let secs = Duration::from_secs;
+        assert_eq!(rate_limited(POLL, None), RATE_LIMIT_BACKOFF);
+        assert_eq!(rate_limited(secs(60), None), secs(120));
+        assert_eq!(rate_limited(MAX_BACKOFF, None), MAX_BACKOFF);
+        // A shorter Retry-After doesn't cut our own backoff short...
+        assert_eq!(rate_limited(secs(60), Some(secs(5))), secs(120));
+        // ...a longer one is waited out, past our cap...
+        assert_eq!(rate_limited(MAX_BACKOFF, Some(secs(600))), secs(600));
+        // ...up to an hour, and waiting that long can't overflow the next
+        // doubling.
+        let longest = rate_limited(POLL, Some(secs(u64::MAX)));
+        assert_eq!(longest, MAX_RETRY_AFTER);
+        assert_eq!(rate_limited(longest, None), MAX_BACKOFF);
     }
 
     #[test]
