@@ -10,12 +10,13 @@
 //! face the way the panel does; the bezel's N marks north.
 
 mod adsb;
+mod clock;
 mod geo;
 mod runways;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
 use tiny_skia::{
@@ -28,6 +29,7 @@ use crate::draw::text_cache::TextCache;
 use crate::draw::{Align, mix};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
+use clock::Stamp;
 
 /// Range at the scope's edge, nautical miles.
 const RANGE_NM: f32 = 25.0;
@@ -79,9 +81,9 @@ pub struct Radar {
     feed: adsb::Shared,
     seq: u64,
     tracks: HashMap<String, Track>,
-    started: Instant,
+    started: Stamp,
     /// Times of the frame being drawn, set by `update`.
-    now: Instant,
+    now: Stamp,
     utc: DateTime<Utc>,
     status: Status,
     /// Clips map features to the scope.
@@ -92,7 +94,7 @@ pub struct Radar {
     text: RefCell<TextCache>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Status {
     Acquiring,
     Live,
@@ -107,7 +109,7 @@ impl Radar {
         if let Some(circle) = PathBuilder::from_circle(C, C, SCOPE_R) {
             scope.fill_path(&circle, FillRule::Winding, true, Transform::identity());
         }
-        let now = Instant::now();
+        let now = Stamp::now();
         Self {
             view: View::new(center, heading),
             feed: adsb::spawn(coarse(center.0), coarse(center.1), FETCH_NM),
@@ -133,12 +135,14 @@ impl Radar {
             }
             // A failed poll (usually a 429) leaves the last aircraft list in
             // place and dead reckoning carries on, so the link only counts
-            // as lost once that data has gone stale.
+            // as lost once that data has gone stale. Stale data with no
+            // failure yet (the first fetch, or the first after a pause or a
+            // suspend) is still being acquired.
             let recent = feed.fetched_at.is_some_and(|t| t.elapsed() < adsb::MAX_AGE);
-            self.status = match (&feed.error, feed.seq) {
-                (Some(_), _) if !recent => Status::NoLink,
-                (None, 0) => Status::Acquiring,
-                _ => Status::Live,
+            self.status = match (&feed.error, recent) {
+                (_, true) => Status::Live,
+                (Some(_), false) => Status::NoLink,
+                (None, false) => Status::Acquiring,
             };
             (feed.seq != self.seq).then(|| (feed.seq, feed.aircraft.clone()))
         };
@@ -193,7 +197,7 @@ fn is_icelandair(ident: &str) -> bool {
 
 impl Screen for Radar {
     fn update(&mut self, now: DateTime<Local>) -> bool {
-        self.now = Instant::now();
+        self.now = Stamp::now();
         self.utc = now.with_timezone(&Utc);
         self.sync(true);
         // The sweep never stops, so every frame is new.
@@ -271,7 +275,7 @@ impl Screen for Radar {
     /// while the radar has been on screen recently.
     fn alerts(&mut self, _now: DateTime<Local>) -> Vec<String> {
         self.sync(false);
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut alerts: Vec<String> = self
             .tracks
             .values()
@@ -407,7 +411,7 @@ fn in_scope((x, y): (f32, f32)) -> bool {
 
 /// Where the aircraft is now, carried forward from its last report along
 /// its track at its ground speed.
-fn dead_reckon(ac: &adsb::Aircraft, now: Instant) -> (f32, f32) {
+fn dead_reckon(ac: &adsb::Aircraft, now: Stamp) -> (f32, f32) {
     let (Some(gs), Some(track)) = (ac.gs, ac.track) else {
         return (ac.lat, ac.lon);
     };
@@ -1012,6 +1016,8 @@ fn dot(px: &mut Pixmap, (x, y): (f32, f32), r: f32, c: Rgb, alpha: u8) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::config::CENTER;
 
@@ -1059,6 +1065,35 @@ mod tests {
     }
 
     #[test]
+    fn link_status_follows_data_age_and_errors() {
+        // `sync(false)` reads the feed without waking its thread, so this
+        // makes no requests.
+        let mut radar = Radar::new(CENTER, 0.0);
+        let status = |radar: &mut Radar, error: Option<&str>, age: Option<Duration>| {
+            {
+                let mut feed = radar.feed.lock().unwrap();
+                feed.error = error.map(String::from);
+                feed.fetched_at = age.map(|age| Stamp::now().checked_sub(age).unwrap());
+                // Every successful fetch bumps the sequence number.
+                if age.is_some() {
+                    feed.seq += 1;
+                }
+            }
+            radar.sync(false);
+            radar.status
+        };
+        let fresh = Some(Duration::ZERO);
+        // A suspend or pause long enough for the data to expire.
+        let stale = Some(adsb::MAX_AGE + Duration::from_secs(1));
+        assert_eq!(status(&mut radar, None, None), Status::Acquiring);
+        assert_eq!(status(&mut radar, Some("x"), None), Status::NoLink);
+        assert_eq!(status(&mut radar, None, fresh), Status::Live);
+        assert_eq!(status(&mut radar, Some("x"), fresh), Status::Live);
+        assert_eq!(status(&mut radar, None, stale), Status::Acquiring);
+        assert_eq!(status(&mut radar, Some("x"), stale), Status::NoLink);
+    }
+
+    #[test]
     fn spots_arrivals_and_departures() {
         for heading in [0.0, 111.0] {
             spots_movements(&View::new(CENTER, heading));
@@ -1066,7 +1101,7 @@ mod tests {
     }
 
     fn spots_movements(view: &View) {
-        let now = Instant::now();
+        let now = Stamp::now();
         let at =
             |ac: &adsb::Aircraft| runways::classify(ac, view.project(dead_reckon(ac, now)), view);
         let finals = adsb::Aircraft {
