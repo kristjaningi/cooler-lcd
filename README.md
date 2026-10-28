@@ -1,5 +1,7 @@
 <h1 align="center">cooler-lcd</h1>
 
+<p align="center"><a href="https://awesomerea.org/resources/cooler-lcd-case/"><img src="https://raw.githubusercontent.com/reacher-z/Awesome-REA/477658fa73f6860e86cd1fc526657c2efdc25194/assets/featured-by-awesome-rea-inline.svg" alt="Featured by Awesome REA"></a></p>
+
 <p align="center">
   Live screens for the LCD on Thermalright Vision CPU coolers,<br>
   drawn in the colors and font of your Omarchy theme.
