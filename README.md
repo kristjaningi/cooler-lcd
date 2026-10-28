@@ -32,9 +32,9 @@ commands from scripts and keybindings.
       </p>
       <b><code>usage</code></b>: Claude Code, Codex and other agents' plan
       usage, in type big enough to read from your chair: the most used
-      agent's headline limit as a huge percentage over a bar with a pace
-      marker, and the time until it resets, then one line each for the rest,
-      most used first.
+      agent's plan and headline limit as a huge percentage over a bar with a
+      pace marker, and the time until it resets, then one line each for the
+      rest, most used first, with a count of any free resets (Codex's).
     </td>
   </tr>
 </table>

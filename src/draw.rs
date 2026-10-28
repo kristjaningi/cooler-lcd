@@ -136,6 +136,35 @@ pub fn arc(
     stroke(px, &path, width, color, 255);
 }
 
+/// A circular arrow, the usual sign for a reset: most of a circle of radius
+/// `r` around (`cx`, `cy`), stroked `width` wide, with an arrowhead at its
+/// end.
+pub fn reset_icon(px: &mut Pixmap, cx: f32, cy: f32, r: f32, width: f32, color: Rgb) {
+    let (start, sweep) = (-60.0_f32, 290.0_f32);
+    arc(px, cx, cy, r, start, sweep, width, color, false);
+    // The arrowhead sits on the circle at the arc's end, pointing along it
+    // (clockwise).
+    let end = (start + sweep).to_radians();
+    let (x, y) = (cx + r * end.cos(), cy + r * end.sin());
+    let (tx, ty) = (-end.sin(), end.cos());
+    let (nx, ny) = (end.cos(), end.sin());
+    let (len, half) = (width * 2.2, width * 1.7);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + tx * len, y + ty * len);
+    pb.line_to(x + nx * half, y + ny * half);
+    pb.line_to(x - nx * half, y - ny * half);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        px.fill_path(
+            &path,
+            &paint(color),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
 /// A line through `points` with the area under it, down to `floor`, shaded
 /// in its color fading out toward the bottom.
 pub fn sparkline(px: &mut Pixmap, points: &[(f32, f32)], floor: f32, width: f32, color: Rgb) {

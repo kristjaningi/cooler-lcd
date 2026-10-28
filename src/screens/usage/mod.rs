@@ -2,9 +2,10 @@
 //! enough to read from across the desk. The agents are ranked by how much
 //! of their headline limit is used, and the most used is the hero: its
 //! headline limit as a huge percentage over a thick bar, with the time
-//! until it resets. Its other limits, then the other agents' headline
-//! limits, follow as one line each: name, percentage, a short bar and the
-//! time left.
+//! until it resets, and its plan beside its name. Its other limits and any
+//! free resets, then the other agents' headline limits, follow as one line
+//! each: name (with a count of free resets when it has some), percentage, a
+//! short bar and the time left.
 //!
 //! The numbers come from Omarchy's records (see `records`); a limit that's
 //! nearly spent takes over the panel.
@@ -15,10 +16,12 @@ use tiny_skia::Pixmap;
 mod records;
 
 use super::Screen;
-use crate::draw::{Align, bar, fill, mix, rounded_rect, text, text_aligned};
+use crate::draw::{
+    Align, bar, fill, mix, reset_icon, rounded_rect, text, text_aligned, text_width,
+};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
-use records::{Agent, Limit, Records, ellipsize, nearly_spent, short_duration};
+use records::{Agent, Limit, Records, Resets, ellipsize, nearly_spent, short_duration};
 
 const MARGIN: f32 = 24.0;
 const RIGHT: f32 = SIZE as f32 - MARGIN;
@@ -38,6 +41,13 @@ const BAR_END: f32 = 334.0;
 /// Pace marker positions are rounded to this many steps across the hero
 /// bar, so it's redrawn when the marker visibly moves rather than every tick.
 const PACE_STEPS: f32 = 400.0;
+/// The plan's type beside the hero's name.
+const PLAN_SIZE: f32 = 28.0;
+/// The reset badge after a line's label: the sign's center this far past
+/// the label, the count this far past the sign's center, in this size.
+const BADGE_GAP: f32 = 20.0;
+const BADGE_COUNT_X: f32 = 13.0;
+const BADGE_SIZE: f32 = 26.0;
 /// Points of usage another agent needs over the hero to take its place, so
 /// two agents at nearly the same level don't swap on every refresh.
 const OVERTAKE: u32 = 10;
@@ -45,6 +55,8 @@ const OVERTAKE: u32 = 10;
 #[derive(Debug, PartialEq)]
 struct Hero {
     name: String,
+    /// The plan the account is on ("Max 5x").
+    plan: Option<String>,
     label: String,
     percent: u32,
     pace: Option<u32>,
@@ -61,8 +73,11 @@ struct Line {
     percent: Option<u32>,
     left: String,
     dim: bool,
-    /// Nearly spent, so it has to stay in view.
-    alert: bool,
+    /// Has to stay in view when lines are dropped to fit: it's nearly
+    /// spent, or it's the hero's free resets, which have nowhere else to go.
+    keep: bool,
+    /// Free resets the agent has left, shown beside its name.
+    resets: Option<u32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -256,6 +271,7 @@ fn layout(agents: &[&Agent], now: DateTime<Utc>) -> Content {
             let r = Reading::of(&agent.limits[head], now);
             content.hero = Some(Hero {
                 name: agent.name.clone(),
+                plan: agent.plan.clone(),
                 label: compact_label(&agent.limits[head].label),
                 percent: r.percent,
                 pace: r.elapsed.map(|e| (e * PACE_STEPS).round() as u32),
@@ -269,6 +285,14 @@ fn layout(agents: &[&Agent], now: DateTime<Utc>) -> Content {
                 .filter(|(j, _)| *j != head)
                 .map(|(_, l)| line(compact_label(&l.label), l, stale.is_some(), now))
                 .collect();
+            content.details.extend(agent.resets.as_ref().map(|r| Line {
+                label: "Resets".into(),
+                percent: None,
+                left: resets_text(r, now),
+                dim: stale.is_some(),
+                keep: true,
+                resets: None,
+            }));
             continue;
         }
         content.others.push(match agent.limits.is_empty() {
@@ -280,11 +304,15 @@ fn layout(agents: &[&Agent], now: DateTime<Utc>) -> Content {
                     .as_deref()
                     .map_or("No limits".into(), |s| ellipsize(s, 14)),
                 dim: true,
-                alert: false,
+                keep: false,
+                resets: None,
             },
             false => {
                 let l = &agent.limits[headline(&agent.limits, now)];
-                line(compact_label(&agent.name), l, stale.is_some(), now)
+                Line {
+                    resets: agent.resets.as_ref().map(|r| r.available),
+                    ..line(compact_label(&agent.name), l, stale.is_some(), now)
+                }
             }
         });
     }
@@ -298,7 +326,17 @@ fn line(label: String, limit: &Limit, dim: bool, now: DateTime<Utc>) -> Line {
         percent: Some(r.percent),
         left: r.left,
         dim,
-        alert: nearly_spent(limit, now),
+        keep: nearly_spent(limit, now),
+        resets: None,
+    }
+}
+
+/// "2 · next expires in 1d 3h", after the "Resets" label: Omarchy's
+/// wording, short enough to fit beside it.
+fn resets_text(r: &Resets, now: DateTime<Utc>) -> String {
+    match r.next_expires.and_then(|t| (t - now).to_std().ok()) {
+        Some(left) => format!("{} · next expires in {}", r.available, short_duration(left)),
+        None => r.available.to_string(),
     }
 }
 
@@ -358,8 +396,8 @@ fn compact_label(label: &str) -> String {
 }
 
 /// Drops lines from the bottom until they fit above the bottom edge,
-/// keeping nearly spent ones (they're why the screen took over): first the
-/// hero's details, then the other agents.
+/// keeping nearly spent ones (they're why the screen took over) and the
+/// hero's free resets: first the hero's details, then the other agents.
 fn fit(mut c: Content) -> Content {
     let height = |c: &Content| {
         let divider = !c.details.is_empty() && !c.others.is_empty();
@@ -371,7 +409,7 @@ fn fit(mut c: Content) -> Content {
         MARGIN + 10.0
     };
     while start + height(&c) > LINES_END + 8.0 {
-        let quiet = |lines: &Vec<Line>| lines.iter().rposition(|l| !l.alert);
+        let quiet = |lines: &Vec<Line>| lines.iter().rposition(|l| !l.keep);
         if let Some(i) = quiet(&c.details) {
             c.details.remove(i);
         } else if let Some(i) = quiet(&c.others) {
@@ -418,6 +456,24 @@ fn draw_hero(px: &mut Pixmap, theme: &Theme, h: &Hero) {
         theme.muted,
         Align::Right,
     );
+    // The plan follows the name, cut short before it runs into the label.
+    if let Some(plan) = &h.plan {
+        let x = MARGIN + text_width(&theme.font, &h.name, 32.0) + 14.0;
+        let room = RIGHT - text_width(&theme.font, &h.label, 28.0) - 20.0 - x;
+        let plan = crate::draw::ellipsize(&theme.font, plan, PLAN_SIZE, room);
+        if room > 0.0 && plan != "…" {
+            text_aligned(
+                px,
+                &theme.font,
+                &plan,
+                PLAN_SIZE,
+                x,
+                52.0,
+                theme.foreground,
+                Align::Left,
+            );
+        }
+    }
 
     text_aligned(
         px,
@@ -500,25 +556,54 @@ fn draw_hero(px: &mut Pixmap, theme: &Theme, h: &Hero) {
 fn draw_line(px: &mut Pixmap, theme: &Theme, l: &Line, y: f32) {
     let baseline = y + 34.0;
     let label_color = if l.dim { theme.muted } else { theme.foreground };
+    // A reset sign and the count of free resets follow the name, which is
+    // cut short if that's what it takes to end them before the percentage.
+    let badge = l.resets.map(|n| {
+        let count = n.to_string();
+        let width = BADGE_GAP + BADGE_COUNT_X + text_width(&theme.font, &count, BADGE_SIZE);
+        (count, width)
+    });
+    let label_end = match l.percent {
+        Some(p) => PCT_X - text_width(&theme.font, &format!("{p}%"), LINE_SIZE) - 10.0,
+        None => RIGHT,
+    } - badge.as_ref().map_or(0.0, |(_, w)| *w);
+    let label = crate::draw::ellipsize(&theme.font, &l.label, LINE_SIZE, label_end - MARGIN);
     text_aligned(
         px,
         &theme.font,
-        &l.label,
+        &label,
         LINE_SIZE,
         MARGIN,
         baseline,
         label_color,
         Align::Left,
     );
-    let Some(percent) = l.percent else {
+    if let Some((count, _)) = badge {
+        let color = if l.dim { theme.muted } else { theme.accent };
+        let x = MARGIN + text_width(&theme.font, &label, LINE_SIZE) + BADGE_GAP;
+        reset_icon(px, x, baseline - 10.0, 8.0, 3.0, color);
         text_aligned(
             px,
             &theme.font,
-            &l.left,
+            &count,
+            BADGE_SIZE,
+            x + BADGE_COUNT_X,
+            baseline,
+            color,
+            Align::Left,
+        );
+    }
+    let Some(percent) = l.percent else {
+        // A note in the room the label leaves.
+        let room = RIGHT - (MARGIN + text_width(&theme.font, &label, LINE_SIZE) + 16.0);
+        text_aligned(
+            px,
+            &theme.font,
+            &crate::draw::ellipsize(&theme.font, &l.left, 24.0, room),
             24.0,
             RIGHT,
             baseline,
-            theme.muted,
+            label_color,
             Align::Right,
         );
         return;
@@ -584,6 +669,8 @@ mod tests {
             limits_stale: false,
             limits,
             status: None,
+            plan: None,
+            resets: None,
         }
     }
 
@@ -758,17 +845,53 @@ mod tests {
     }
 
     #[test]
+    fn shows_the_plan_and_free_resets() {
+        let now = Utc::now();
+        let resets = Resets {
+            available: 2,
+            next_expires: Some(now + chrono::Duration::minutes(90)),
+        };
+        let mut codex = agent("codex", vec![limit("Weekly", 0.6, now)]);
+        codex.plan = Some("Pro 100".into());
+        codex.resets = Some(resets.clone());
+        let mut claude = agent("claude", vec![limit("Session", 0.3, now)]);
+        claude.plan = Some("Max 5x".into());
+
+        // As the hero: the plan by its name, the resets as a line of their own.
+        let c = layout(&[&codex, &claude], now);
+        assert_eq!(c.hero.unwrap().plan.as_deref(), Some("Pro 100"));
+        assert_eq!(c.details.len(), 1);
+        assert!(c.details[0].left.starts_with("2 · next expires in 1h"));
+        assert!(c.details[0].keep, "it has nowhere else to go");
+        assert_eq!(c.others[0].resets, None);
+
+        // Below it: the count beside its name.
+        let c = layout(&[&claude, &codex], now);
+        assert!(c.details.is_empty());
+        assert_eq!(c.others[0].resets, Some(2));
+
+        // Past the first expiry, only the count is known.
+        let lapsed = Resets {
+            next_expires: Some(now - chrono::Duration::minutes(1)),
+            ..resets
+        };
+        assert_eq!(resets_text(&lapsed, now), "2");
+    }
+
+    #[test]
     fn fit_drops_quiet_lines_first() {
         let line = |label: &str, alert| Line {
             label: label.into(),
             percent: Some(if alert { 95 } else { 10 }),
             left: String::new(),
             dim: false,
-            alert,
+            keep: alert,
+            resets: None,
         };
         let c = fit(Content {
             hero: Some(Hero {
                 name: "Claude".into(),
+                plan: None,
                 label: "Session".into(),
                 percent: 10,
                 pace: None,

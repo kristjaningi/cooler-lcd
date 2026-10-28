@@ -42,6 +42,14 @@ struct Record {
     limits: Vec<RecordLimit>,
     #[serde(default)]
     usage_status_text: Option<String>,
+    /// The plan, as the provider names it ("Max 5x", "Pro 100"). Kept loose
+    /// like the resets: anything but a string is no plan.
+    #[serde(default)]
+    tier_label: Option<serde_json::Value>,
+    /// Free resets of the rate limits (Codex). Kept loose: a malformed
+    /// field loses the resets, never the record.
+    #[serde(default)]
+    reset_credits: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +73,17 @@ pub struct Agent {
     pub limits_stale: bool,
     pub limits: Vec<Limit>,
     pub status: Option<String>,
+    /// The plan the account is on, as the provider names it.
+    pub plan: Option<String>,
+    pub resets: Option<Resets>,
+}
+
+/// Free resets that wipe the rate limits on demand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resets {
+    pub available: u32,
+    /// When the first of them lapses.
+    pub next_expires: Option<DateTime<Utc>>,
 }
 
 impl Agent {
@@ -234,6 +253,24 @@ fn agent(r: Record) -> Agent {
         limits_stale: r.limits_stale,
         limits,
         status,
+        plan: r
+            .tier_label
+            .as_ref()
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| ellipsize(&capitalize(t), 24)),
+        resets: r.reset_credits.as_ref().and_then(|c| {
+            Some(Resets {
+                // A count, even if written as 2.0.
+                available: c
+                    .get("available")?
+                    .as_f64()
+                    .filter(|n| n.fract() == 0.0 && (1.0..=u32::MAX as f64).contains(n))?
+                    as u32,
+                next_expires: time(c.get("nextExpiresAt").and_then(|t| t.as_str())),
+            })
+        }),
     }
 }
 
@@ -337,6 +374,37 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_plan_and_free_resets() {
+        let json = r#"{"id":"codex","tierLabel":"pro 100",
+            "resetCredits":{"available":2,"nextExpiresAt":"2026-10-29T19:11:39+00:00"},
+            "limits":[{"label":"Weekly (7-day)","percent":0.18}]}"#;
+        let a = agent(serde_json::from_str(json).unwrap());
+        assert_eq!(a.plan.as_deref(), Some("Pro 100"));
+        let resets = a.resets.unwrap();
+        assert_eq!(resets.available, 2);
+        assert!(resets.next_expires.is_some());
+
+        let json = r#"{"id":"grok","tierLabel":"",
+            "resetCredits":{"available":"two"},"limits":[]}"#;
+        let a = agent(serde_json::from_str(json).unwrap());
+        assert_eq!((a.plan, a.resets), (None, None), "and the record survives");
+
+        let json = r#"{"id":"codex","resetCredits":{"available":0}}"#;
+        assert_eq!(agent(serde_json::from_str(json).unwrap()).resets, None);
+        let json = r#"{"id":"codex","resetCredits":{"available":2.5}}"#;
+        assert_eq!(agent(serde_json::from_str(json).unwrap()).resets, None);
+        let json = r#"{"id":"codex","resetCredits":{"available":3.0}}"#;
+        let a = agent(serde_json::from_str(json).unwrap());
+        assert_eq!(a.resets.map(|r| r.available), Some(3));
+
+        for tier in ["null", "5", "{}"] {
+            let json = format!(r#"{{"id":"claude","tierLabel":{tier}}}"#);
+            let a = agent(serde_json::from_str(&json).unwrap());
+            assert_eq!(a.plan, None, "{tier}");
+        }
+    }
+
+    #[test]
     fn judges_freshness_by_the_limits_not_the_record() {
         let now = Utc::now();
         let record = |extra: &str| {
@@ -386,6 +454,8 @@ mod tests {
                     window: None,
                 }],
                 status: None,
+                plan: None,
+                resets: None,
             }],
         };
         assert_eq!(records.alerts(now).len(), 1);
