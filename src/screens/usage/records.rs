@@ -18,6 +18,7 @@ const STALE: Duration = Duration::from_secs(45 * 60);
 
 /// Agents listed first, in this order, and shown even without limits (to
 /// say why). Any other agent appears after them once it reports a limit.
+/// The screen ranks agents by use; this order only breaks ties.
 const PREFERRED: &[&str] = &["claude", "codex"];
 
 /// One agent's record as Omarchy writes it.
@@ -109,7 +110,18 @@ impl Records {
         }
     }
 
+    /// Records already read, from a directory that doesn't exist.
+    #[cfg(test)]
+    pub fn with_agents(agents: Vec<Agent>) -> Self {
+        Self {
+            dir: PathBuf::from("/nonexistent"),
+            seen: Vec::new(),
+            agents,
+        }
+    }
+
     /// The agents to show, preferred ones first, from the latest records.
+    /// The screen reorders them by use.
     pub fn agents(&mut self) -> &[Agent] {
         self.reload();
         &self.agents

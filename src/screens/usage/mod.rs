@@ -1,9 +1,10 @@
 //! Plan usage for AI coding agents (Claude Code, Codex, ...), in type big
-//! enough to read from across the desk. The first
-//! agent with limits (Claude Code, usually) is the hero: its headline limit
-//! as a huge percentage over a thick bar, with the time until it resets.
-//! Its other limits, then the other agents' headline limits, follow as one
-//! line each: name, percentage, a short bar and the time left.
+//! enough to read from across the desk. The agents are ranked by how much
+//! of their headline limit is used, and the most used is the hero: its
+//! headline limit as a huge percentage over a thick bar, with the time
+//! until it resets. Its other limits, then the other agents' headline
+//! limits, follow as one line each: name, percentage, a short bar and the
+//! time left.
 //!
 //! The numbers come from Omarchy's records (see `records`); a limit that's
 //! nearly spent takes over the panel.
@@ -37,6 +38,9 @@ const BAR_END: f32 = 334.0;
 /// Pace marker positions are rounded to this many steps across the hero
 /// bar, so it's redrawn when the marker visibly moves rather than every tick.
 const PACE_STEPS: f32 = 400.0;
+/// Points of usage another agent needs over the hero to take its place, so
+/// two agents at nearly the same level don't swap on every refresh.
+const OVERTAKE: u32 = 10;
 
 #[derive(Debug, PartialEq)]
 struct Hero {
@@ -73,6 +77,14 @@ struct Content {
 pub struct Usage {
     records: Records,
     content: Option<Content>,
+    /// The hero, which keeps the top spot until it's overtaken.
+    leader: Option<Leader>,
+}
+
+/// The hero's agent and the percentage it was shown at.
+struct Leader {
+    id: String,
+    percent: u32,
 }
 
 impl Usage {
@@ -80,13 +92,23 @@ impl Usage {
         Self {
             records: Records::new(),
             content: None,
+            leader: None,
         }
     }
 }
 
 impl Screen for Usage {
     fn update(&mut self, now: DateTime<Local>) -> bool {
-        let content = Some(fit(layout(self.records.agents(), now.with_timezone(&Utc))));
+        let now = now.with_timezone(&Utc);
+        let agents = ranked(self.records.agents(), self.leader.as_ref(), now);
+        self.leader = agents
+            .iter()
+            .find(|a| !a.limits.is_empty())
+            .map(|a| Leader {
+                id: a.id.clone(),
+                percent: standing(a, now).percent,
+            });
+        let content = Some(fit(layout(&agents, now)));
         let changed = self.content != content;
         self.content = content;
         changed
@@ -160,8 +182,67 @@ impl Screen for Usage {
     }
 }
 
+/// Where an agent stands in the ranking.
+struct Standing {
+    /// Fresh with limits, stale with limits, or without limits.
+    group: u8,
+    /// Its headline limit's percentage, as shown.
+    percent: u32,
+    /// Its headline limit is nearly spent.
+    alert: bool,
+}
+
+fn standing(a: &Agent, now: DateTime<Utc>) -> Standing {
+    let Some(head) = (!a.limits.is_empty()).then(|| &a.limits[headline(&a.limits, now)]) else {
+        return Standing {
+            group: 2,
+            percent: 0,
+            alert: false,
+        };
+    };
+    Standing {
+        group: a.stale_age(now).is_some() as u8,
+        percent: Reading::of(head, now).percent,
+        alert: nearly_spent(head, now),
+    }
+}
+
+/// Orders the agents most used first: fresh ones with limits by their
+/// headline limit's percentage, then stale ones the same way, then those
+/// without limits. Ties keep the records' order (Claude Code, Codex, then
+/// the rest by id).
+///
+/// The current `leader` stays first while it's in the leading group and the
+/// runner-up isn't `OVERTAKE` points ahead of it, unless the runner-up is
+/// nearly spent and the leader isn't (that's what took over the panel), or
+/// the leader just dropped by `OVERTAKE` or more (its window reset).
+fn ranked<'a>(agents: &'a [Agent], leader: Option<&Leader>, now: DateTime<Utc>) -> Vec<&'a Agent> {
+    let mut agents: Vec<&Agent> = agents.iter().collect();
+    agents.sort_by_key(|a| {
+        let s = standing(a, now);
+        (s.group, std::cmp::Reverse(s.percent))
+    });
+    let Some(leader) = leader else { return agents };
+    if let Some(i) = agents.iter().position(|a| a.id == leader.id)
+        && i > 0
+    {
+        let held = standing(agents[i], now);
+        let top = standing(agents[0], now);
+        if held.group == top.group
+            && held.group < 2
+            && top.percent < held.percent + OVERTAKE
+            && (held.alert || !top.alert)
+            && leader.percent < held.percent + OVERTAKE
+        {
+            let held = agents.remove(i);
+            agents.insert(0, held);
+        }
+    }
+    agents
+}
+
 /// Sorts the agents into the hero and the lines below it.
-fn layout(agents: &[Agent], now: DateTime<Utc>) -> Content {
+fn layout(agents: &[&Agent], now: DateTime<Utc>) -> Content {
     let hero_at = agents.iter().position(|a| !a.limits.is_empty());
     let mut content = Content {
         hero: None,
@@ -551,13 +632,129 @@ mod tests {
             ),
             agent("grok", vec![limit("Weekly", 0.2, now)]),
         ];
-        let c = layout(&agents, now);
+        let c = layout(&agents.iter().collect::<Vec<_>>(), now);
         let hero = c.hero.unwrap();
         assert_eq!((hero.name.as_str(), hero.percent), ("codex", 40));
         assert_eq!(c.details.len(), 1);
         let others: Vec<_> = c.others.iter().map(|l| l.label.as_str()).collect();
         assert_eq!(others, ["claude", "grok"]);
         assert_eq!(c.others[0].percent, None);
+    }
+
+    #[test]
+    fn ranks_the_most_used_first() {
+        let now = Utc::now();
+        let mut stale = agent("amp", vec![limit("Session", 0.9, now)]);
+        stale.limits_stale = true;
+        let agents = [
+            agent("claude", vec![limit("Session", 0.2, now)]),
+            agent("codex", vec![limit("Session", 0.6, now)]),
+            agent("gemini", vec![]),
+            agent("grok", vec![limit("Session", 0.2, now)]),
+            stale,
+        ];
+        let ids = |leader| -> Vec<String> {
+            ranked(&agents, leader, now)
+                .iter()
+                .map(|a| a.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            ids(None),
+            ["codex", "claude", "grok", "amp", "gemini"],
+            "ties keep their order; stale, then no limits, go last"
+        );
+    }
+
+    #[test]
+    fn ranks_by_the_headline_limit_as_shown() {
+        let now = Utc::now();
+        let mut reset = limit("Session", 0.8, now);
+        reset.resets_at = Some(now - chrono::Duration::minutes(1));
+        let agents = [
+            agent("claude", vec![reset, limit("Weekly", 0.3, now)]),
+            agent(
+                "codex",
+                vec![limit("Session", 0.4, now), limit("Weekly", 0.95, now)],
+            ),
+        ];
+        let ids: Vec<_> = ranked(&agents, None, now)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["codex", "claude"],
+            "a reset window counts as 0%; a nearly spent one leads"
+        );
+    }
+
+    #[test]
+    fn the_hero_holds_until_clearly_overtaken() {
+        let now = Utc::now();
+        let pair = |claude, codex| {
+            [
+                agent("claude", vec![limit("Session", claude, now)]),
+                agent("codex", vec![limit("Session", codex, now)]),
+            ]
+        };
+        let claude = |percent| Leader {
+            id: "claude".into(),
+            percent,
+        };
+        let first =
+            |agents: &[Agent], leader: Option<&Leader>| ranked(agents, leader, now)[0].id.clone();
+        assert_eq!(first(&pair(0.40, 0.49), Some(&claude(40))), "claude");
+        assert_eq!(first(&pair(0.40, 0.50), Some(&claude(40))), "codex");
+        assert_eq!(first(&pair(0.40, 0.49), None), "codex");
+
+        // A stale leader can't hold against fresh numbers.
+        let mut agents = pair(0.40, 0.45);
+        agents[0].limits_stale = true;
+        assert_eq!(first(&agents, Some(&claude(40))), "codex");
+
+        // Nor can a calm leader against the limit that took over the panel,
+        // though two nearly spent ones still hold.
+        assert_eq!(first(&pair(0.85, 0.92), Some(&claude(85))), "codex");
+        assert_eq!(first(&pair(0.91, 0.99), Some(&claude(91))), "claude");
+    }
+
+    #[test]
+    fn a_reset_leader_gives_up_the_top_spot() {
+        let now = Utc::now();
+        let mut reset = limit("Session", 0.8, now);
+        reset.resets_at = Some(now - chrono::Duration::minutes(1));
+        let agents = [
+            agent("claude", vec![reset]),
+            agent("codex", vec![limit("Session", 0.09, now)]),
+        ];
+        let leader = |percent| Leader {
+            id: "claude".into(),
+            percent,
+        };
+        let first = |percent| ranked(&agents, Some(&leader(percent)), now)[0].id.clone();
+        assert_eq!(first(80), "codex", "dropped from 80% to 0%");
+        assert_eq!(first(5), "claude", "a small drop still holds");
+    }
+
+    #[test]
+    fn update_keeps_the_hero_between_refreshes() {
+        let now = Utc::now();
+        let mut usage = Usage::new();
+        let mut hero = |claude, codex| {
+            usage.records = Records::with_agents(vec![
+                agent("claude", vec![limit("Session", claude, now)]),
+                agent("codex", vec![limit("Session", codex, now)]),
+            ]);
+            usage.update(now.with_timezone(&Local));
+            let c = usage.content.as_ref().unwrap();
+            c.hero.as_ref().unwrap().name.clone()
+        };
+        assert_eq!(hero(0.40, 0.30), "claude");
+        assert_eq!(hero(0.40, 0.45), "claude");
+        assert_eq!(hero(0.40, 0.55), "codex");
+        assert_eq!(hero(0.50, 0.55), "codex");
+        assert_eq!(hero(0.92, 0.55), "claude", "nearly spent takes over");
     }
 
     #[test]

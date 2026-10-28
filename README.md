@@ -31,9 +31,10 @@ commands from scripts and keybindings.
         <img src="docs/usage.jpg" width="360" alt="The usage screen: Claude Code's session at 64%, then weekly limits and other agents">
       </p>
       <b><code>usage</code></b>: Claude Code, Codex and other agents' plan
-      usage, in type big enough to read from your chair: the main agent's
-      headline limit as a huge percentage over a bar with a pace marker, and
-      the time until it resets, then one line each for the rest.
+      usage, in type big enough to read from your chair: the most used
+      agent's headline limit as a huge percentage over a bar with a pace
+      marker, and the time until it resets, then one line each for the rest,
+      most used first.
     </td>
   </tr>
 </table>
