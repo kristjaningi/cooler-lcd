@@ -15,6 +15,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::clock::Stamp;
+
 /// adsb.fi allows one request a second; positions are dead reckoned between
 /// polls, so a slow rate still moves smoothly. This is the fastest we poll;
 /// the pace slows if we get rate limited anyway.
@@ -28,6 +30,9 @@ const PACE_RELAX: Duration = Duration::from_millis(100);
 /// First wait after HTTP 429, doubling while it persists.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// The longest `Retry-After` honored, so a garbled header can't park the
+/// feed for days (or overflow the doubling above).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Position reports older than this are dropped, and tracks expire once
 /// their last report is this old.
 pub const MAX_AGE: Duration = Duration::from_secs(120);
@@ -55,7 +60,7 @@ pub struct Aircraft {
     /// Squawking 7500, 7600 or 7700, or flagged as an emergency.
     pub emergency: bool,
     /// When the position was measured.
-    pub fixed_at: Instant,
+    pub fixed_at: Stamp,
 }
 
 #[derive(Default)]
@@ -66,7 +71,7 @@ pub struct State {
     pub seq: u64,
     pub error: Option<String>,
     /// When the last fetch succeeded.
-    pub fetched_at: Option<Instant>,
+    pub fetched_at: Option<Stamp>,
     /// Last time the radar was drawn; fetching pauses when this gets old.
     wanted_at: Option<Instant>,
     /// The fetching thread, to wake when it's paused and wanted again.
@@ -126,22 +131,24 @@ fn run(shared: &Shared, url: &str) {
                 }
                 s.aircraft = aircraft;
                 s.seq += 1;
-                s.fetched_at = Some(Instant::now());
+                s.fetched_at = Some(Stamp::now());
                 pace = relax(pace);
                 backoff = pace;
                 pace
             }
             Err(e) => {
                 backoff = match e {
+                    // Our own backoff stops growing at `MAX_BACKOFF`, but a
+                    // longer wait the server asks for is honored.
                     FetchError::RateLimited(retry_after) => {
                         pace = slow_down(pace);
                         (backoff * 2)
                             .max(RATE_LIMIT_BACKOFF)
-                            .max(retry_after.unwrap_or_default())
+                            .min(MAX_BACKOFF)
+                            .max(retry_after.unwrap_or_default().min(MAX_RETRY_AFTER))
                     }
-                    FetchError::Other(_) => backoff * 2,
-                }
-                .min(MAX_BACKOFF);
+                    FetchError::Other(_) => (backoff * 2).min(MAX_BACKOFF),
+                };
                 let msg = match e {
                     FetchError::RateLimited(_) => "adsb.fi: rate limited".to_string(),
                     FetchError::Other(e) => format!("{e:#}"),
@@ -196,7 +203,7 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<Aircraft>, FetchError> {
         status => return Err(anyhow!("adsb.fi: HTTP {status}").into()),
     }
     let body = resp.body_mut().read_to_string()?;
-    Ok(parse(&body, Instant::now())?)
+    Ok(parse(&body, Stamp::now())?)
 }
 
 #[derive(Deserialize)]
@@ -224,7 +231,7 @@ struct Entry {
     seen_pos: Option<f32>,
 }
 
-fn parse(body: &str, now: Instant) -> Result<Vec<Aircraft>> {
+fn parse(body: &str, now: Stamp) -> Result<Vec<Aircraft>> {
     let resp: Response = serde_json::from_str(body).context("parsing adsb.fi response")?;
     Ok(resp
         .ac
@@ -316,7 +323,7 @@ mod tests {
             {"hex":"bad002","type":"adsb_icao","lat":64.0,"lon":-22.0,"seen_pos":180},
             {"hex":"bad003","type":"adsb_icao","lat":64.0,"lon":-22.0,"gs":1e30,"track":90}
         ]}"#;
-        let ac = parse(body, Instant::now()).unwrap();
+        let ac = parse(body, Stamp::now()).unwrap();
         // Out-of-range coordinates and expired positions are dropped; an
         // impossible speed is discarded but the position kept.
         assert_eq!(ac.len(), 3);
