@@ -3,8 +3,10 @@
 //! Omarchy refreshes them while its bar runs (every 15 minutes by default);
 //! this only reads them, so it makes no network requests of its own.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -15,6 +17,10 @@ const ALERT_USED: f32 = 0.9;
 /// Limits older than this are shown dimmed with their age: three missed
 /// refreshes at Omarchy's default interval.
 const STALE: Duration = Duration::from_secs(45 * 60);
+/// Far more than any record needs (they're a few KB). Records are parsed and
+/// laid out on the frame loop, so a much bigger one would stall it for
+/// seconds even without running out of memory.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// Agents listed first, in this order, and shown even without limits (to
 /// say why). Any other agent appears after them once it reports a limit.
@@ -185,19 +191,15 @@ impl Records {
             return;
         }
         // A record caught mid-write fails to parse; it keeps its last good
-        // reading and is read again on the next change.
+        // reading and is read again on the next change. So does one that
+        // can't be read safely.
         let mut agents: Vec<Agent> = files
             .iter()
-            .filter_map(|(path, _)| {
-                let parsed = fs::read(path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-                match parsed {
-                    Some(record) => Some(agent(record)),
-                    None => {
-                        let id = path.file_stem()?.to_str()?;
-                        self.agents.iter().find(|a| a.id == id).cloned()
-                    }
+            .filter_map(|(path, _)| match read_record(path) {
+                Some(record) => Some(agent(record)),
+                None => {
+                    let id = path.file_stem()?.to_str()?;
+                    self.agents.iter().find(|a| a.id == id).cloned()
                 }
             })
             .collect();
@@ -206,6 +208,32 @@ impl Records {
         self.agents = agents;
         self.seen = files;
     }
+}
+
+/// The record at `path`, if it's a regular file of a sensible size holding
+/// one. This runs on the frame loop, where a named pipe would block for good
+/// and opening a device can have side effects, so check before opening;
+/// O_NONBLOCK, against a pipe swapped in since the check.
+fn read_record(path: &Path) -> Option<Record> {
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn rank(id: &str) -> usize {
@@ -336,6 +364,115 @@ pub fn short_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory of the test's own for records.
+    fn record_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cooler-lcd-records-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn record_json(used: f32) -> String {
+        format!(r#"{{"id":"claude","limits":[{{"label":"Weekly","percent":{used}}}]}}"#)
+    }
+
+    #[test]
+    fn files_that_could_block_the_frame_loop_are_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let dir = record_dir("types");
+        fs::write(dir.join("claude.json"), record_json(0.5)).unwrap();
+        let fifo = dir.join("pipe.json");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated pathname in our test directory.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(&fifo, dir.join("linked.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("zero.json")).unwrap();
+        fs::create_dir(dir.join("directory.json")).unwrap();
+
+        let (done, agents) = mpsc::channel();
+        let worker_dir = dir.clone();
+        let worker = thread::spawn(move || {
+            let mut records = Records {
+                dir: worker_dir,
+                seen: Vec::new(),
+                agents: Vec::new(),
+            };
+            let _ = done.send(records.agents().to_vec());
+        });
+        let agents = agents
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading the records blocked or panicked");
+        worker.join().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "claude");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_replaced_by_something_unreadable_keeps_its_last_good_reading() {
+        let dir = record_dir("replaced");
+        let path = dir.join("claude.json");
+        fs::write(&path, record_json(0.5)).unwrap();
+        let mut records = Records {
+            dir: dir.clone(),
+            seen: Vec::new(),
+            agents: Vec::new(),
+        };
+        assert_eq!(records.agents()[0].limits[0].used, 0.5);
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(records.agents()[0].limits[0].used, 0.5, "a directory");
+        fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert_eq!(records.agents()[0].limits[0].used, 0.5, "a device");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_oversized_record_keeps_its_last_good_reading() {
+        let dir = record_dir("oversized");
+        let path = dir.join("claude.json");
+        fs::write(&path, record_json(0.5)).unwrap();
+        let mut records = Records {
+            dir: dir.clone(),
+            seen: Vec::new(),
+            agents: Vec::new(),
+        };
+        assert_eq!(records.agents()[0].limits[0].used, 0.5);
+
+        // Valid JSON, so only the size can be what turns it away.
+        let padded = format!(
+            "{}{}",
+            record_json(0.9),
+            " ".repeat(MAX_RECORD_BYTES as usize)
+        );
+        fs::write(&path, padded).unwrap();
+        // A later mtime, whatever the filesystem's timestamp granularity.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(records.agents()[0].limits[0].used, 0.5);
+
+        // Back within bounds, it's read again.
+        fs::write(&path, record_json(0.25)).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+        assert_eq!(records.agents()[0].limits[0].used, 0.25);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn formats_durations() {
