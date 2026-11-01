@@ -121,10 +121,6 @@ impl Screen for Music {
         self.shared.lock().unwrap().present()
     }
 
-    fn refresh(&mut self) {
-        mpris::refresh(&self.shared);
-    }
-
     fn loading(&self) -> bool {
         !self.shared.lock().unwrap().ready
     }

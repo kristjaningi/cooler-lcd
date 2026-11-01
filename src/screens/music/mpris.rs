@@ -203,22 +203,6 @@ pub fn spawn() -> Shared {
     shared
 }
 
-/// Polls once on the caller's thread, for a command that needs to know
-/// right away whether anything's playing after the poller was parked.
-/// Blocks for the `busctl` round trips, a few ms.
-pub fn refresh(shared: &Shared) {
-    let previous = shared
-        .lock()
-        .unwrap()
-        .playback
-        .as_ref()
-        .map(|p| p.player.clone());
-    // On failure the poller says why on its next round.
-    if let Ok(playback) = poll(previous.as_deref()) {
-        publish(shared, playback);
-    }
-}
-
 /// Identity includes the player, track metadata and local file revision:
 /// players can reuse a cover path, even without changing the track ID.
 /// Not the length, which browsers and Spotify often send a poll or two

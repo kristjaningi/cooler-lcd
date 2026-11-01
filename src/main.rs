@@ -790,15 +790,10 @@ impl Carousel {
         for alert in self.screens[i].1.alerts(Local::now()) {
             self.seen[i].insert(alert, now);
         }
-        // While off, its workers were parked and what it knows is stale.
-        // Waking them now is enough: the next tick sets the real activity.
+        // Discovery stays on the worker; a slow player mustn't block commands.
         let screen = &mut self.screens[i].1;
         if !screen.present() {
             screen.activity(true, false);
-            screen.refresh();
-        }
-        // With nothing to show yet, it waits for its turn once it has.
-        if !screen.present() {
             return Ok(format!("{name} on, shown once it has something to show"));
         }
         // Not from under a timer or pushed content; it comes up after.
@@ -1308,27 +1303,44 @@ mod tests {
     }
 
     #[test]
-    fn turning_on_a_parked_screen_refreshes_it_before_deciding() {
-        /// Knows it has something to show only after a refresh.
-        struct Parked(Rc<Cell<bool>>);
+    fn turning_on_a_parked_screen_waits_for_background_discovery() {
+        struct Parked {
+            present: Rc<Cell<bool>>,
+            active: Rc<Cell<bool>>,
+        }
         impl Screen for Parked {
             fn update(&mut self, _: DateTime<Local>) -> bool {
                 false
             }
             fn draw(&self, _: &mut Pixmap, _: &Theme) {}
             fn present(&self) -> bool {
-                self.0.get()
+                self.present.get()
             }
-            fn refresh(&mut self) {
-                self.0.set(true);
+            fn activity(&mut self, active: bool, _: bool) {
+                self.active.set(active);
             }
         }
         for command in [Command::On("s1".into()), Command::Toggle("s1".into())] {
             let (mut c, _) = carousel(2);
-            c.screens[1].1 = Box::new(Parked(Rc::default()));
+            let present = Rc::new(Cell::new(false));
+            let active = Rc::new(Cell::new(false));
+            c.screens[1].1 = Box::new(Parked {
+                present: present.clone(),
+                active: active.clone(),
+            });
             c.command(Command::Off("s1".into())).unwrap();
-            assert_eq!(c.command(command).unwrap(), "s1 on");
-            assert_eq!(c.index, 1, "shown right away");
+            assert!(
+                c.command(command)
+                    .unwrap()
+                    .contains("once it has something")
+            );
+            assert!(active.get(), "discovery is woken");
+            assert!(c.on[1]);
+            assert_eq!(c.index, 0, "doesn't wait for discovery on the frame loop");
+            present.set(true);
+            c.shown_at -= c.rotate;
+            assert!(tick(&mut c));
+            assert_eq!(c.index, 1, "joins the rotation after discovery");
         }
     }
 
