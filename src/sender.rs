@@ -46,6 +46,7 @@ struct Slot {
     /// Published since the sender last picked it up.
     fresh: bool,
     connected: bool,
+    generation: u64,
 }
 
 type Shared = Arc<(Mutex<Slot>, Condvar)>;
@@ -62,21 +63,26 @@ impl Sender {
         Self { shared }
     }
 
-    /// Hands a new frame to the sender, which sends it right away.
-    pub fn publish(&self, frame: &[u8], receipt: Option<Receipt>) {
+    /// Queues a frame only if the connection it was drawn for is still current.
+    pub fn publish(&self, connection: u64, frame: &[u8], receipt: Option<Receipt>) -> bool {
         let (slot, wake) = &*self.shared;
         let mut slot = slot.lock().unwrap();
+        if !slot.connected || slot.generation != connection {
+            return false;
+        }
         slot.frame = Some(Arc::new(Frame {
             bytes: frame.to_vec(),
             receipt,
         }));
         slot.fresh = true;
         wake.notify_one();
+        true
     }
 
-    /// Whether the panel is connected; there's no point drawing otherwise.
-    pub fn connected(&self) -> bool {
-        self.shared.0.lock().unwrap().connected
+    /// A new generation on every connection, including outages between ticks.
+    pub fn connection(&self) -> Option<u64> {
+        let slot = self.shared.0.lock().unwrap();
+        slot.connected.then_some(slot.generation)
     }
 }
 
@@ -133,7 +139,13 @@ fn next_frame(shared: &Shared) -> Option<Arc<Frame>> {
 }
 
 fn set_connected(shared: &Shared, connected: bool) {
-    shared.0.lock().unwrap().connected = connected;
+    let mut slot = shared.0.lock().unwrap();
+    slot.connected = connected;
+    slot.frame = None;
+    slot.fresh = false;
+    if connected {
+        slot.generation += 1;
+    }
 }
 
 #[cfg(test)]
@@ -145,9 +157,11 @@ mod tests {
         let sender = Sender {
             shared: Shared::default(),
         };
+        set_connected(&sender.shared, true);
+        let connection = sender.connection().unwrap();
         let receipt = Receipt::default();
-        sender.publish(b"first", Some(receipt.clone()));
-        sender.publish(b"redrawn", Some(receipt.clone()));
+        assert!(sender.publish(connection, b"first", Some(receipt.clone())));
+        assert!(sender.publish(connection, b"redrawn", Some(receipt.clone())));
         let frame = next_frame(&sender.shared).unwrap();
         assert_eq!(frame.bytes, b"redrawn");
         assert!(
@@ -162,5 +176,62 @@ mod tests {
             Some(first),
             "keepalive must not restart the lifetime"
         );
+
+        set_connected(&sender.shared, false);
+        set_connected(&sender.shared, true);
+        assert!(sender.publish(
+            sender.connection().unwrap(),
+            b"still active",
+            Some(receipt.clone())
+        ));
+        next_frame(&sender.shared)
+            .unwrap()
+            .receipt
+            .as_ref()
+            .unwrap()
+            .mark_sent();
+        assert_eq!(
+            receipt.sent_at(),
+            Some(first),
+            "reconnect isn't a new lifetime"
+        );
+    }
+
+    #[test]
+    fn reconnect_discards_queued_content_and_rejects_in_flight_redraws() {
+        let sender = Sender {
+            shared: Shared::default(),
+        };
+        let dismissed = Receipt::default();
+        assert!(sender.connection().is_none());
+        assert!(!sender.publish(0, b"offline", Some(dismissed.clone())));
+
+        set_connected(&sender.shared, true);
+        let old_connection = sender.connection().unwrap();
+        assert!(sender.publish(old_connection, b"dismissed", Some(dismissed.clone())));
+        set_connected(&sender.shared, false);
+        assert!(sender.connection().is_none());
+        {
+            let slot = sender.shared.0.lock().unwrap();
+            assert!(slot.frame.is_none());
+            assert!(!slot.fresh);
+        }
+        assert!(!sender.publish(old_connection, b"offline", Some(dismissed.clone())));
+
+        // Reconnect before the frame loop observes the outage.
+        set_connected(&sender.shared, true);
+        let connection = sender.connection().unwrap();
+        assert_ne!(connection, old_connection);
+        assert!(next_frame(&sender.shared).is_none(), "nothing to replay");
+        assert!(!sender.publish(old_connection, b"old render", Some(dismissed.clone())));
+        assert!(sender.publish(connection, b"current", None));
+        assert!(!sender.publish(old_connection, b"late render", Some(dismissed.clone())));
+        assert_eq!(next_frame(&sender.shared).unwrap().bytes, b"current");
+        assert_eq!(
+            next_frame(&sender.shared).unwrap().bytes,
+            b"current",
+            "keepalive"
+        );
+        assert!(dismissed.sent_at().is_none());
     }
 }

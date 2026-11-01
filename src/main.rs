@@ -191,6 +191,7 @@ fn main() -> Result<()> {
     let mut next_update = Instant::now();
     // The rotation bar's length on the panel, in pixels.
     let mut shown_bar = None;
+    let mut shown_connection = None;
     // A request that cut the last sleep short.
     let mut woken = None;
     loop {
@@ -212,12 +213,13 @@ fn main() -> Result<()> {
         }
 
         // Nothing to draw for until the sender has a panel; redraw once it does.
-        if !sender.connected() {
+        let Some(connection) = sender.connection() else {
             carousel.activity(false);
             dirty = true;
             woken = idle(requests.as_ref(), OFFLINE_TICK);
             continue;
-        }
+        };
+        dirty |= shown_connection != Some(connection);
 
         // Follow Omarchy theme and font switches. The theme directory is
         // briefly missing while Omarchy swaps it in, so ignore that state.
@@ -315,10 +317,12 @@ fn main() -> Result<()> {
             };
             match encoded {
                 Ok(()) => {
-                    dirty = false;
-                    shown_bar = bar;
                     let receipt = carousel.overlay(away).map(|f| f.receipt.clone());
-                    sender.publish(renderer.frame(), receipt);
+                    dirty = !sender.publish(connection, renderer.frame(), receipt);
+                    if !dirty {
+                        shown_connection = Some(connection);
+                        shown_bar = bar;
+                    }
                 }
                 Err(e) => log.error(format!("rendering: {e:#}")),
             }
