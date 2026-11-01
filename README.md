@@ -270,9 +270,10 @@ defaults are used.
   state) every 2 s while the screen is up and every 5 s while it isn't,
   about 0.1% of a core. Polling pauses while music is switched off, the
   desktop is away, or the panel is disconnected. A playing player wins,
-  then a paused one. The track's position is run on between polls, so the
-  bar keeps moving. Album
-  art is read from wherever the player points (a file, an inline `data:`
+  then a paused one. Turning music on wakes discovery in the background;
+  it joins the rotation once a player is found. The track's position is run
+  on between polls, so the bar keeps moving. Album art is read from wherever
+  the player points (a regular file, an inline `data:`
   URL, or the web, capped at 10 MB and 2048 pixels a side), then scaled
   and shaded on a separate worker only while music is visible, so slow art
   never delays playback updates. The cache follows the player, track and
