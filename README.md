@@ -300,7 +300,7 @@ defaults are used.
   every second whatever the frame loop is doing (`src/sender.rs`). It
   reconnects when the cooler is unplugged or a write fails, and after
   suspend (detected as the wall clock jumping ahead of the monotonic
-  clock).
+  clock). Reconnection waits for a fresh frame of the current content.
 
 ## Development
 
