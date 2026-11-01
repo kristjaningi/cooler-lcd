@@ -324,6 +324,8 @@ it in `build()` and `NAMES` in `src/screens/mod.rs`. `update()` runs inside the
 frame loop, so fetch anything slow (network, big files) on a background thread.
 Implement `alerts()` to take over the panel when something happens.
 
+Listed in [Awesome REA](https://awesomerea.org/resources/cooler-lcd-case/).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
