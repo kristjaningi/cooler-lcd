@@ -7,6 +7,7 @@
 //! the download and a cap on the picture's dimensions.
 
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -59,11 +60,19 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
     }
     if let Some(path) = url.strip_prefix("file://") {
         let path = percent_decode(path);
-        let mut bytes = Vec::new();
-        std::fs::File::open(&path)
+        let regular = std::fs::metadata(&path)
             .with_context(|| format!("opening {path}"))?
-            .take(MAX_BYTES + 1)
-            .read_to_end(&mut bytes)?;
+            .is_file();
+        ensure!(regular, "art must be a regular file");
+        // A pipe swapped in after the check mustn't strand the artwork worker.
+        let file = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .with_context(|| format!("opening {path}"))?;
+        ensure!(file.metadata()?.is_file(), "art must be a regular file");
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         ensure!(bytes.len() as u64 <= MAX_BYTES, "{path} is too big");
         return Ok(bytes);
     }
@@ -283,12 +292,56 @@ mod tests {
         assert_eq!(fetch(&inline).unwrap(), bytes);
         let path = std::env::temp_dir().join(format!("cooler-lcd art {}.jpg", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
+        let link = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let linked = fetch(&format!("file://{}", link.display()).replace(' ', "%20"));
+        std::fs::remove_file(link).unwrap();
         let url = format!("file://{}", path.display()).replace(' ', "%20");
         let read = fetch(&url);
         let _ = std::fs::remove_file(&path);
+        assert_eq!(linked.unwrap(), bytes);
         assert_eq!(read.unwrap(), bytes);
         assert!(fetch("ftp://example.com/a.jpg").is_err());
         assert!(fetch("data:image/png,raw").is_err());
+    }
+
+    #[test]
+    fn local_art_rejects_pipes_symlinks_to_pipes_and_devices() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!("cooler-lcd-art-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated pathname in our test directory.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let link = dir.join("linked pipe");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [&fifo, &link, &dir, std::path::Path::new("/dev/zero")] {
+            let url = format!("file://{}", path.display()).replace(' ', "%20");
+            let (done, result) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let _ = done.send(fetch(&url));
+            });
+            let result = result.recv_timeout(Duration::from_secs(2));
+            if result.is_err() {
+                // Release a regressed FIFO reader before failing the test.
+                drop(
+                    std::fs::File::options()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo),
+                );
+            }
+            worker.join().unwrap();
+            assert!(
+                result.expect("artwork load blocked").is_err(),
+                "{}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
