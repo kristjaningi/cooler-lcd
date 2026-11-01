@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,8 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 const RETRY: Duration = Duration::from_secs(30);
 /// Temperatures change slowly; querying NVML is the costliest thing we do.
 const POLL: Duration = Duration::from_secs(3);
+/// Five missed polls: old readings must not look live after a driver stalls.
+const STALE: Duration = Duration::from_secs(15);
 /// How far back the temperature history goes.
 pub const HISTORY: Duration = Duration::from_secs(10 * 60);
 
@@ -49,10 +51,24 @@ pub type Sample = (Instant, Option<f32>, Option<f32>);
 struct Latest {
     readings: Readings,
     history: VecDeque<Sample>,
-    /// When the last poll finished; none before the first.
+    /// When the last completed poll began; none before the first completes.
     polled_at: Option<Instant>,
-    /// A poll has been asked for and hasn't finished.
-    asked: bool,
+    /// When the poll that hasn't finished was asked for.
+    asked: Option<Instant>,
+}
+
+impl Latest {
+    /// The readings to show. Nothing polls while nothing asks, so age alone
+    /// means nothing: after time off screen these are the last ones until
+    /// the new poll is in. They're unavailable only once a poll has gone
+    /// unanswered for `STALE`.
+    fn shown(&self) -> Readings {
+        if self.asked.is_some_and(|t| t.elapsed() >= STALE) {
+            Readings::default()
+        } else {
+            self.readings
+        }
+    }
 }
 
 type Shared = Arc<(Mutex<Latest>, Condvar)>;
@@ -66,27 +82,41 @@ impl Sensors {
     /// has something to show.
     pub fn new() -> Self {
         let shared = Shared::default();
-        shared.0.lock().unwrap().asked = true;
+        shared.0.lock().unwrap().asked = Some(Instant::now());
         let s = shared.clone();
         thread::spawn(move || run(&s));
         Self { shared }
     }
 
-    /// CPU and GPU temperature in °C, refreshed at most every `POLL`.
+    /// CPU and GPU temperature in °C, refreshed at most every `POLL`, for
+    /// alerts: stricter than `readings`, since what the sensors said before
+    /// polling went idle (the desktop away, say) mustn't take over the panel.
     pub fn temps(&mut self) -> (Option<f32>, Option<f32>) {
-        let r = self.readings();
-        (r.cpu_temp, r.gpu_temp)
+        // One lock throughout, so a poll finishing now can't vouch for the
+        // sample before it.
+        let l = self.latest();
+        if l.polled_at.is_some_and(|t| t.elapsed() < STALE) {
+            let r = l.shown();
+            (r.cpu_temp, r.gpu_temp)
+        } else {
+            (None, None)
+        }
     }
 
     /// The latest readings, starting a fresh poll if they're `POLL` old.
     pub fn readings(&mut self) -> Readings {
+        self.latest().shown()
+    }
+
+    /// What the polling thread left, having asked for a fresh poll if due.
+    fn latest(&self) -> MutexGuard<'_, Latest> {
         let (latest, wake) = &*self.shared;
         let mut l = latest.lock().unwrap();
-        if !l.asked && l.polled_at.is_none_or(|t| t.elapsed() >= POLL) {
-            l.asked = true;
+        if l.asked.is_none() && l.polled_at.is_none_or(|t| t.elapsed() >= POLL) {
+            l.asked = Some(Instant::now());
             wake.notify_one();
         }
-        l.readings
+        l
     }
 
     /// Calls `f` with the temperatures over the last `HISTORY`, oldest
@@ -107,24 +137,35 @@ fn run(shared: &Shared) {
     let mut probe = Probe::new();
     loop {
         drop(
-            wake.wait_while(latest.lock().unwrap(), |l| !l.asked)
+            wake.wait_while(latest.lock().unwrap(), |l| l.asked.is_none())
                 .unwrap(),
         );
-        let r = probe.read();
-        let now = Instant::now();
-        let mut l = latest.lock().unwrap();
-        l.readings = r;
-        l.history.push_back((now, r.cpu_temp, r.gpu_temp));
-        while l
-            .history
-            .front()
-            .is_some_and(|(t, ..)| now.duration_since(*t) > HISTORY)
-        {
-            l.history.pop_front();
-        }
-        l.polled_at = Some(now);
-        l.asked = false;
+        poll(shared, || probe.read());
     }
+}
+
+fn poll(shared: &Shared, read: impl FnOnce() -> Readings) {
+    // A slow driver mustn't make readings collected earlier look fresh.
+    let started = Instant::now();
+    let r = read();
+    let now = Instant::now();
+    let mut l = shared.0.lock().unwrap();
+    // It's still history, but too old by now to show as the latest.
+    l.readings = if now.duration_since(started) < STALE {
+        r
+    } else {
+        Readings::default()
+    };
+    l.history.push_back((started, r.cpu_temp, r.gpu_temp));
+    while l
+        .history
+        .front()
+        .is_some_and(|(t, ..)| now.duration_since(*t) > HISTORY)
+    {
+        l.history.pop_front();
+    }
+    l.polled_at = Some(started);
+    l.asked = None;
 }
 
 /// The sensors themselves, read on the polling thread.
@@ -281,6 +322,121 @@ fn find_cpu_temp() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_completed_poll_does_not_make_its_old_sample_fresh() {
+        let shared = Shared::default();
+        let mut sensors = Sensors {
+            shared: shared.clone(),
+        };
+        poll(&shared, || {
+            let readings = Readings {
+                cpu_temp: Some(90.0),
+                ..Readings::default()
+            };
+            // CPU temperature has been read; a later driver call stalls.
+            thread::sleep(STALE);
+            readings
+        });
+        assert_eq!(sensors.readings(), Readings::default());
+        assert_eq!(sensors.temps(), (None, None));
+        assert!(
+            shared.0.lock().unwrap().asked.is_some(),
+            "request a new sample"
+        );
+        sensors.with_history(|h| {
+            let (at, cpu, _) = h.back().unwrap();
+            assert!(at.elapsed() >= STALE, "history keeps acquisition time");
+            assert_eq!(*cpu, Some(90.0));
+        });
+
+        poll(&shared, || Readings {
+            cpu_temp: Some(50.0),
+            ..Readings::default()
+        });
+        assert_eq!(sensors.temps(), (Some(50.0), None));
+    }
+
+    #[test]
+    fn an_idle_gap_keeps_the_last_readings_on_screen_but_not_in_alerts() {
+        let shared = Shared::default();
+        let hot = Readings {
+            cpu_temp: Some(90.0),
+            gpu_temp: Some(50.0),
+            ..Readings::default()
+        };
+        let mut sensors = Sensors {
+            shared: shared.clone(),
+        };
+        {
+            // Nothing has asked for a while: the desktop was away, say.
+            let mut l = shared.0.lock().unwrap();
+            l.readings = hot;
+            l.polled_at = Some(Instant::now() - STALE * 10);
+        }
+        assert_eq!(sensors.temps(), (None, None), "too old to alert on");
+        assert!(shared.0.lock().unwrap().asked.is_some(), "asks for a poll");
+        assert_eq!(sensors.readings(), hot, "not blank while it's answered");
+
+        poll(&shared, || Readings {
+            cpu_temp: Some(50.0),
+            ..Readings::default()
+        });
+        assert_eq!(sensors.temps(), (Some(50.0), None));
+    }
+
+    #[test]
+    fn stalled_polls_hide_old_readings_and_recovery_restores_them() {
+        let shared = Shared::default();
+        let readings = Readings {
+            cpu_temp: Some(90.0),
+            gpu_temp: Some(50.0),
+            cpu_load: Some(0.5),
+            gpu_load: Some(0.3),
+            mem: Some((10, 20)),
+            gpu_power: Some(80.0),
+        };
+        let mut sensors = Sensors {
+            shared: shared.clone(),
+        };
+        assert_eq!(
+            sensors.readings(),
+            Readings::default(),
+            "no first sample yet"
+        );
+        {
+            let mut l = shared.0.lock().unwrap();
+            l.readings = readings;
+            l.polled_at = Some(Instant::now());
+            l.asked = None;
+        }
+        assert_eq!(sensors.readings(), readings);
+        {
+            let mut l = shared.0.lock().unwrap();
+            l.polled_at = Some(Instant::now() - STALE);
+            l.asked = Some(Instant::now() - STALE); // A driver call hasn't returned.
+        }
+        assert_eq!(sensors.readings(), Readings::default());
+        assert_eq!(
+            sensors.temps(),
+            (None, None),
+            "old temperatures cannot alert"
+        );
+        assert!(
+            shared.0.lock().unwrap().asked.is_some(),
+            "no second worker is started"
+        );
+        {
+            let mut l = shared.0.lock().unwrap();
+            l.polled_at = Some(Instant::now());
+            l.asked = None;
+        }
+        assert_eq!(
+            sensors.readings(),
+            readings,
+            "a completed poll restores readings"
+        );
+    }
 
     #[test]
     fn parses_proc_stat() {

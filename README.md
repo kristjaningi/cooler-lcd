@@ -242,7 +242,8 @@ defaults are used.
 - **Sensors:** CPU temperature from hwmon (`k10temp` Tdie/Tctl,
   `coretemp`), CPU load and memory from `/proc`, GPU temperature, load and
   power from NVML, polled every 3 s. Missing sensors are retried every 30 s
-  (`src/screens/sensors.rs`).
+  (`src/screens/sensors.rs`). If a poll goes unanswered for 15 s, readings
+  become unavailable until polling recovers.
 - **Theme:** colors from `~/.local/state/omarchy/current/theme/colors.toml`,
   font from `omarchy-font-current` via fontconfig, falling back to the system
   sans (`src/theme.rs`). Both are reloaded when `colors.toml` or
