@@ -242,20 +242,7 @@ fn main() -> Result<()> {
         // While the desktop is locked or dark, a dim clock stands in for the
         // carousel, whose screens then stop updating (and fetching).
         let away = desktop.away();
-        if away != was_away {
-            if !away {
-                carousel.resume();
-            }
-            log.info(
-                if away {
-                    "desktop away; dimming"
-                } else {
-                    "desktop back"
-                }
-                .into(),
-            );
-            was_away = away;
-        }
+        dirty |= update_away(&mut carousel, &mut was_away, away, &mut log);
         // Expire a flash before choosing what to show, so the carousel's
         // screens never get drawn while away, not even for one tick.
         dirty |= if away {
@@ -346,6 +333,27 @@ fn main() -> Result<()> {
             wake.saturating_duration_since(Instant::now()),
         );
     }
+}
+
+/// A desktop transition can switch between a timer and held content even
+/// when neither side shows the away clock. Both transitions need a redraw.
+fn update_away(carousel: &mut Carousel, was_away: &mut bool, away: bool, log: &mut Log) -> bool {
+    if away == *was_away {
+        return false;
+    }
+    if !away {
+        carousel.resume();
+    }
+    log.info(
+        if away {
+            "desktop away; dimming"
+        } else {
+            "desktop back"
+        }
+        .into(),
+    );
+    *was_away = away;
+    true
 }
 
 /// Sleeps for `length`, or until a request comes in, which it returns, so
@@ -1470,6 +1478,43 @@ mod tests {
         c.command(content(content::Lifetime::UntilNext)).unwrap();
         assert!(c.overlay(true).is_none());
         assert!(c.overlay(false).is_some(), "and is back with the desktop");
+    }
+
+    #[test]
+    fn unlocking_redraws_held_content_over_a_running_timer() {
+        let (mut c, _) = carousel(2);
+        c.command(Command::Timer(Duration::from_secs(600))).unwrap();
+        c.command(content(content::Lifetime::UntilNext)).unwrap();
+        let mut log = Log::default();
+        let mut was_away = false;
+        let theme = Theme::fallback();
+        let mut renderer = Renderer::new();
+        let now = Local::now();
+        c.current(false).update(now);
+        renderer.render(c.current(false).as_ref(), &theme).unwrap();
+        let held_frame = renderer.frame().to_vec();
+
+        assert!(update_away(&mut c, &mut was_away, true, &mut log));
+        c.current(true).update(now);
+        renderer.render(c.current(true).as_ref(), &theme).unwrap();
+        assert_ne!(renderer.frame(), held_frame);
+        assert!(c.timing() && !c.timer_up(), "no away clock on either side");
+
+        let dirty = update_away(&mut c, &mut was_away, false, &mut log);
+        assert!(
+            !c.current(false).update(now),
+            "the held screen itself hasn't changed"
+        );
+        assert!(dirty, "the desktop transition must force a redraw");
+        if dirty {
+            renderer.render(c.current(false).as_ref(), &theme).unwrap();
+        }
+        assert_eq!(
+            renderer.frame(),
+            held_frame,
+            "held content returns to the panel"
+        );
+        assert!(!update_away(&mut c, &mut was_away, false, &mut log));
     }
 
     fn request(
