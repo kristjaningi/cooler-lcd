@@ -4,13 +4,12 @@
 //! drawn in the accent color and the GPU in cyan throughout, so the chart's
 //! lines match the rings.
 
-use std::time::Instant;
-
 use chrono::{DateTime, Local};
 use tiny_skia::Pixmap;
 
 use super::Screen;
 use super::sensors::{HISTORY, Readings, Sample, Sensors};
+use crate::clock::Stamp;
 use crate::draw::{Align, arc, fill, mix, rounded_rect, sparkline, text, text_aligned};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
@@ -81,7 +80,7 @@ impl Screen for Dashboard {
             loads: [percent(r.cpu_load), percent(r.gpu_load)],
             mem: percent(r.mem.map(|(used, total)| used as f32 / total.max(1) as f32)),
             power: r.gpu_power.map(|w| w.round() as u32),
-            chart: self.sensors.with_history(|h| chart(h, Instant::now())),
+            chart: self.sensors.with_history(|h| chart(h, Stamp::now())),
         };
         let changed = self.content.as_ref() != Some(&content);
         self.content = Some(content);
@@ -334,7 +333,7 @@ fn draw_chart(px: &mut Pixmap, theme: &Theme, c: &Content, colors: [Rgb; 2]) {
 
 /// The history in `CHART_STEPS` buckets across the last `HISTORY`, each the
 /// latest reading in it, rounded to whole degrees.
-fn chart(history: &std::collections::VecDeque<Sample>, now: Instant) -> [Vec<Option<i32>>; 2] {
+fn chart(history: &std::collections::VecDeque<Sample>, now: Stamp) -> [Vec<Option<i32>>; 2] {
     let mut out = [vec![None; CHART_STEPS], vec![None; CHART_STEPS]];
     let span = HISTORY.as_secs_f32();
     for &(at, cpu, gpu) in history {
@@ -366,10 +365,12 @@ mod tests {
 
     #[test]
     fn charts_history_by_age() {
-        let now = Instant::now();
+        // Ahead of the clock, so the samples before it can't predate boot.
+        let now = Stamp::now() + HISTORY * 2;
+        let ago = |age: Duration| now.checked_sub(age).unwrap();
         let history = [
-            (now - HISTORY, Some(40.0), None),
-            (now - HISTORY / 2, Some(50.4), Some(60.0)),
+            (ago(HISTORY), Some(40.0), None),
+            (ago(HISTORY / 2), Some(50.4), Some(60.0)),
             (now, Some(70.0), Some(65.0)),
         ]
         .into_iter()
@@ -381,7 +382,7 @@ mod tests {
         assert_eq!(gpu[0], None);
         assert_eq!(cpu.iter().flatten().count(), 3);
         // Too old to show.
-        let old = [(now - HISTORY - Duration::from_secs(30), Some(1.0), None)]
+        let old = [(ago(HISTORY + Duration::from_secs(30)), Some(1.0), None)]
             .into_iter()
             .collect();
         assert!(chart(&old, now)[0].iter().all(Option::is_none));

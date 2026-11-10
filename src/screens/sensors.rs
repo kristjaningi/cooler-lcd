@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 
+use crate::clock::Stamp;
+
 const RETRY: Duration = Duration::from_secs(30);
 /// Temperatures change slowly; querying NVML is the costliest thing we do.
 const POLL: Duration = Duration::from_secs(3);
@@ -43,8 +45,10 @@ pub struct Readings {
     pub gpu_power: Option<f32>,
 }
 
-/// One history sample: when, and the CPU and GPU temperature then.
-pub type Sample = (Instant, Option<f32>, Option<f32>);
+/// One history sample: when, and the CPU and GPU temperature then. Timed
+/// by a clock that counts through suspend, or last night's temperatures
+/// would chart as the last ten minutes on waking.
+pub type Sample = (Stamp, Option<f32>, Option<f32>);
 
 /// The readings as the polling thread left them.
 #[derive(Default)]
@@ -146,9 +150,9 @@ fn run(shared: &Shared) {
 
 fn poll(shared: &Shared, read: impl FnOnce() -> Readings) {
     // A slow driver mustn't make readings collected earlier look fresh.
-    let started = Instant::now();
+    let (started, sampled) = (Instant::now(), Stamp::now());
     let r = read();
-    let now = Instant::now();
+    let (now, stamp) = (Instant::now(), Stamp::now());
     let mut l = shared.0.lock().unwrap();
     // It's still history, but too old by now to show as the latest.
     l.readings = if now.duration_since(started) < STALE {
@@ -156,11 +160,11 @@ fn poll(shared: &Shared, read: impl FnOnce() -> Readings) {
     } else {
         Readings::default()
     };
-    l.history.push_back((started, r.cpu_temp, r.gpu_temp));
+    l.history.push_back((sampled, r.cpu_temp, r.gpu_temp));
     while l
         .history
         .front()
-        .is_some_and(|(t, ..)| now.duration_since(*t) > HISTORY)
+        .is_some_and(|(t, ..)| stamp - *t > HISTORY)
     {
         l.history.pop_front();
     }
