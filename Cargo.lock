@@ -136,6 +136,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "flate2",
  "image",
  "jpeg-encoder",
  "libc",

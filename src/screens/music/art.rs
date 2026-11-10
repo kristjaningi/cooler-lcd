@@ -83,7 +83,8 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
             .user_agent(concat!("cooler-lcd/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        return Ok(agent
+        let mut bytes = Vec::new();
+        agent
             .get(url)
             // Some CDNs serve WebP unless asked for something else.
             .header("Accept", "image/jpeg, image/png")
@@ -91,8 +92,14 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
             .with_context(|| format!("fetching {url}"))?
             .body_mut()
             .with_config()
+            // What's downloaded, which may be compressed...
             .limit(MAX_BYTES)
-            .read_to_vec()?);
+            .reader()
+            // ...and what that expands to, which the limit doesn't count.
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= MAX_BYTES, "art at {url} is too big");
+        return Ok(bytes);
     }
     bail!("art at {url:?}, which isn't a file, data or web URL")
 }
@@ -342,6 +349,39 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn caps_web_art_at_its_size_once_decompressed() {
+        use std::io::Write;
+
+        // Just over the cap of zeros: under a hundredth of it on the way.
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&vec![0; MAX_BYTES as usize + 1]).unwrap();
+        let body = gzip.finish().unwrap();
+        assert!((body.len() as u64) < MAX_BYTES / 100);
+
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cover.png", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let (mut request, mut byte) = (Vec::new(), [0]);
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            // The reader may hang up once it has seen too much.
+            let _ = stream.write_all(&body);
+        });
+        // Its size, so a failure doesn't print the bytes.
+        let fetched = fetch(&url).map(|bytes| bytes.len());
+        let refused = fetched.expect_err("art over the cap");
+        assert!(refused.to_string().contains("too big"), "{refused:#}");
     }
 
     #[test]

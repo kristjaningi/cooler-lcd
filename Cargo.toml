@@ -21,6 +21,10 @@ toml = "1"
 ureq = "3"
 zune-jpeg = { version = "0.5", default-features = false }
 
+[dev-dependencies]
+# Already here by way of ureq; the tests compress a response with it.
+flate2 = "1"
+
 # A panic in any worker thread (USB sender, control socket, desktop or radar
 # feed) would otherwise leave the process running but broken, out of reach of
 # the unit's Restart=always. Aborting lets systemd start it fresh.
