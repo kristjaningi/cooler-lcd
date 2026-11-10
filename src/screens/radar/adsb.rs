@@ -255,7 +255,12 @@ fn parse(body: &str, now: Stamp) -> Result<Vec<Aircraft>> {
                 _ => None,
             };
             let squawk_emergency = matches!(e.squawk.as_deref(), Some("7500" | "7600" | "7700"));
-            let flagged = e.emergency.as_deref().is_some_and(|s| s != "none");
+            // Not "lifeguard" (a medical flight), "minfuel" or "reserved":
+            // priority statuses in the same field, and no emergency.
+            let flagged = matches!(
+                e.emergency.as_deref(),
+                Some("general" | "nordo" | "unlawful" | "downed")
+            );
             let (lat, lon) = (e.lat?, e.lon?);
             if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
                 return None;
@@ -327,6 +332,22 @@ mod tests {
         let longest = rate_limited(POLL, Some(secs(u64::MAX)));
         assert_eq!(longest, MAX_RETRY_AFTER);
         assert_eq!(rate_limited(longest, None), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn tells_emergencies_from_priority_statuses() {
+        let flagged = |status: &str| {
+            let body = format!(
+                r#"{{"ac":[{{"hex":"4cc516","lat":64.1,"lon":-21.9,"emergency":"{status}"}}]}}"#
+            );
+            parse(&body, Stamp::now()).unwrap()[0].emergency
+        };
+        for status in ["general", "nordo", "unlawful", "downed"] {
+            assert!(flagged(status), "{status}");
+        }
+        for status in ["none", "lifeguard", "minfuel", "reserved"] {
+            assert!(!flagged(status), "{status}");
+        }
     }
 
     #[test]
