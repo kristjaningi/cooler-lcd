@@ -94,7 +94,8 @@ pub struct State {
     /// Whether a poll has been accepted: until then there's no telling
     /// whether anything's playing, so not ready, art or no art.
     polled: bool,
-    playing_at: Option<Instant>,
+    /// The player last seen playing, and when.
+    played: Option<(String, Instant)>,
     activity: Activity,
     worker: Option<Thread>,
     art_worker: Option<Thread>,
@@ -133,9 +134,14 @@ impl State {
 
     /// Asked while suspended too (`on music`, coming back from away), when
     /// the last poll is all there is. Suspended polls aren't accepted, so a
-    /// stale player still ages out after `GRACE`.
+    /// stale player still ages out after `GRACE`. The grace is for the
+    /// player that was playing: when it quits, another that has sat paused
+    /// all along is what's left to show, and isn't worth a turn.
     pub fn present(&self) -> bool {
-        self.playback.is_some() && self.playing_at.is_some_and(|t| t.elapsed() < GRACE)
+        let (Some(playback), Some((player, at))) = (&self.playback, &self.played) else {
+            return false;
+        };
+        *player == playback.player && at.elapsed() < GRACE
     }
 
     fn accept(&mut self, playback: Option<Playback>, desired: Option<ArtKey>) {
@@ -145,8 +151,8 @@ impl State {
             return;
         }
         self.desired = desired.filter(|_| self.activity == Activity::Visible);
-        if playback.as_ref().is_some_and(|p| p.playing) {
-            self.playing_at = Some(Instant::now());
+        if let Some(p) = playback.as_ref().filter(|p| p.playing) {
+            self.played = Some((p.player.clone(), Instant::now()));
         }
         self.playback = playback;
         self.polled = true;
@@ -544,7 +550,7 @@ mod tests {
         let mut s = State::default();
         s.activity(true, false);
         assert!(!s.present());
-        s.playing_at = Some(Instant::now());
+        s.played = Some(("x".into(), Instant::now()));
         assert!(!s.present(), "played, but the player's gone");
         s.playback = playback(
             "x",
@@ -554,8 +560,28 @@ mod tests {
             }),
         );
         assert!(s.present());
-        s.playing_at = Instant::now().checked_sub(GRACE);
+        s.played = Some(("x".into(), Instant::now().checked_sub(GRACE).unwrap()));
         assert!(!s.present(), "paused too long");
+    }
+
+    #[test]
+    fn a_player_paused_all_along_doesnt_linger_for_one_that_quit() {
+        let shared = Shared::default();
+        shared.lock().unwrap().activity(true, false);
+        publish(&shared, Some(track("A", "https://example.test/a.jpg")));
+        assert!(shared.lock().unwrap().present());
+        // That player quits; the poll falls back to one paused for hours.
+        let mut paused = track("B", "https://example.test/b.jpg");
+        paused.player = "other-player".into();
+        paused.playing = false;
+        publish(&shared, Some(paused.clone()));
+        assert!(!shared.lock().unwrap().present());
+        // Pausing the one that was playing still keeps it a while.
+        paused.playing = true;
+        publish(&shared, Some(paused.clone()));
+        paused.playing = false;
+        publish(&shared, Some(paused));
+        assert!(shared.lock().unwrap().present());
     }
 
     fn track(title: &str, url: &str) -> Playback {
