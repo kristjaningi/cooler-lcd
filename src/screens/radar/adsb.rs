@@ -21,7 +21,7 @@ use super::clock::Stamp;
 /// polls, so a slow rate still moves smoothly. This is the fastest we poll;
 /// the pace slows if we get rate limited anyway.
 const POLL: Duration = Duration::from_secs(10);
-/// Each 429 slows the steady pace by this much, up to `MAX_PACE`...
+/// A 429 at the steady pace slows it by this much, up to `MAX_PACE`...
 const PACE_STEP: Duration = Duration::from_secs(2);
 const MAX_PACE: Duration = Duration::from_secs(60);
 /// ...and each success speeds it up by this much, so it settles just under
@@ -113,6 +113,8 @@ fn run(shared: &Shared, url: &str) {
     // the wait while errors persist.
     let mut pace = POLL;
     let mut backoff = POLL;
+    // Whether the last poll succeeded, so this one comes at the steady pace.
+    let mut steady = true;
     // Set under the lock that `want` takes, so a radar that comes up after
     // this is looked at wakes the thread, and one that came up before is
     // seen below.
@@ -134,16 +136,24 @@ fn run(shared: &Shared, url: &str) {
                 s.fetched_at = Some(Stamp::now());
                 pace = relax(pace);
                 backoff = pace;
+                steady = true;
                 pace
             }
             Err(e) => {
                 backoff = match e {
                     FetchError::RateLimited(retry_after) => {
-                        pace = slow_down(pace);
+                        // Only a 429 at the steady pace says the pace is
+                        // too fast. More of them while backing off would
+                        // leave it at its slowest for hours after a long
+                        // spell of them.
+                        if steady {
+                            pace = slow_down(pace);
+                        }
                         rate_limited(backoff, retry_after)
                     }
                     FetchError::Other(_) => (backoff * 2).min(MAX_BACKOFF),
                 };
+                steady = false;
                 let msg = match e {
                     FetchError::RateLimited(_) => "adsb.fi: rate limited".to_string(),
                     FetchError::Other(e) => format!("{e:#}"),
