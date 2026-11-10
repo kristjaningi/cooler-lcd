@@ -156,7 +156,12 @@ impl Radar {
         let mut tracks = HashMap::with_capacity(aircraft.len());
         for ac in aircraft {
             let mut history = VecDeque::new();
-            if let Some(mut old) = self.tracks.remove(&ac.hex) {
+            // The trail carries on from the last report only if that's
+            // recent. After a long pause in fetching (the desktop away, a
+            // suspend) it would run from where the aircraft was back then.
+            if let Some(mut old) = self.tracks.remove(&ac.hex)
+                && ac.fixed_at.saturating_duration_since(old.ac.fixed_at) < adsb::MAX_AGE
+            {
                 history = std::mem::take(&mut old.history);
                 if (old.ac.lat, old.ac.lon) != (ac.lat, ac.lon) {
                     history.push_back((old.ac.lat, old.ac.lon));
@@ -1091,6 +1096,33 @@ mod tests {
         assert_eq!(status(&mut radar, Some("x"), fresh), Status::Live);
         assert_eq!(status(&mut radar, None, stale), Status::Acquiring);
         assert_eq!(status(&mut radar, Some("x"), stale), Status::NoLink);
+    }
+
+    #[test]
+    fn a_trail_doesnt_reach_back_across_a_pause() {
+        let mut radar = Radar::new(CENTER, 0.0);
+        let seen = |lat: f32, fixed_at: Stamp| {
+            vec![adsb::Aircraft {
+                hex: "4cc2a1".into(),
+                ident: "ICE614".into(),
+                lat,
+                lon: -22.6,
+                alt: Some(1400),
+                gs: None,
+                track: None,
+                vrate: None,
+                emergency: false,
+                fixed_at,
+            }]
+        };
+        let now = Stamp::now();
+        radar.merge(seen(63.90, now));
+        radar.merge(seen(63.91, now + Duration::from_secs(10)));
+        assert_eq!(radar.tracks["4cc2a1"].history.len(), 1);
+        // Nothing fetched for a while, then the same aircraft again.
+        let later = now + Duration::from_secs(10) + adsb::MAX_AGE;
+        radar.merge(seen(63.95, later));
+        assert!(radar.tracks["4cc2a1"].history.is_empty());
     }
 
     #[test]
