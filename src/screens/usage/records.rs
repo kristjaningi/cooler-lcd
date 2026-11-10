@@ -342,7 +342,7 @@ fn short_label(label: &str) -> String {
 }
 
 /// Cuts `s` to at most `max` characters, so a long message stays on screen.
-pub fn ellipsize(s: &str, max: usize) -> String {
+fn ellipsize(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }

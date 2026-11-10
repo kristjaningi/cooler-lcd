@@ -21,7 +21,7 @@ use crate::draw::{
 };
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
-use records::{Agent, Limit, Records, Resets, ellipsize, nearly_spent, short_duration};
+use records::{Agent, Limit, Records, Resets, nearly_spent, short_duration};
 
 const MARGIN: f32 = 24.0;
 const RIGHT: f32 = SIZE as f32 - MARGIN;
@@ -302,7 +302,8 @@ fn layout(agents: &[&Agent], now: DateTime<Utc>) -> Content {
                 left: agent
                     .status
                     .as_deref()
-                    .map_or("No limits".into(), |s| ellipsize(s, 14)),
+                    // As it is: drawing cuts it to the room there is.
+                    .map_or("No limits".into(), String::from),
                 dim: true,
                 keep: false,
                 resets: None,
@@ -712,7 +713,10 @@ mod tests {
     fn first_agent_with_limits_is_the_hero() {
         let now = Utc::now();
         let agents = [
-            agent("claude", vec![]),
+            Agent {
+                status: Some("Sign in to see usage".into()),
+                ..agent("claude", vec![])
+            },
             agent(
                 "codex",
                 vec![limit("Session", 0.4, now), limit("Weekly", 0.1, now)],
@@ -726,6 +730,7 @@ mod tests {
         let others: Vec<_> = c.others.iter().map(|l| l.label.as_str()).collect();
         assert_eq!(others, ["claude", "grok"]);
         assert_eq!(c.others[0].percent, None);
+        assert_eq!(c.others[0].left, "Sign in to see usage", "the whole note");
     }
 
     #[test]
