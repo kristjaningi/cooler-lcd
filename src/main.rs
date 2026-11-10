@@ -5,6 +5,7 @@
 //! `control`); `--screen` shows just that screen instead of the config's
 //! list.
 
+mod clock;
 mod config;
 mod content;
 mod control;

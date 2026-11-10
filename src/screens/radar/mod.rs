@@ -10,7 +10,6 @@
 //! face the way the panel does; the bezel's N marks north.
 
 mod adsb;
-mod clock;
 mod geo;
 mod runways;
 
@@ -25,11 +24,11 @@ use tiny_skia::{
 };
 
 use super::Screen;
+use crate::clock::Stamp;
 use crate::draw::text_cache::TextCache;
 use crate::draw::{Align, mix};
 use crate::render::SIZE;
 use crate::theme::{Rgb, Theme};
-use clock::Stamp;
 
 /// Range at the scope's edge, nautical miles.
 const RANGE_NM: f32 = 25.0;

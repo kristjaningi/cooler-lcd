@@ -1,7 +1,7 @@
-//! A clock for the radar's data ages. `Instant` is CLOCK_MONOTONIC on
-//! Linux, which stops while the machine is suspended, so aircraft fetched
-//! before a night's sleep would read as seconds old on waking and be drawn,
-//! and alerted on, as live traffic. CLOCK_BOOTTIME keeps counting through
+//! A clock for the ages of data. `Instant` is CLOCK_MONOTONIC on Linux,
+//! which stops while the machine is suspended, so aircraft fetched before a
+//! night's sleep would read as seconds old on waking and be drawn, and
+//! alerted on, as live traffic. CLOCK_BOOTTIME keeps counting through
 //! suspend.
 
 use std::ops::{Add, Sub};

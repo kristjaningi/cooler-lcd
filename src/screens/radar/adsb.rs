@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::clock::Stamp;
+use crate::clock::Stamp;
 
 /// adsb.fi allows one request a second; positions are dead reckoned between
 /// polls, so a slow rate still moves smoothly. This is the fastest we poll;
