@@ -29,9 +29,30 @@ impl Desktop {
         let away = Arc::new(AtomicBool::new(false));
         let a = away.clone();
         thread::spawn(move || {
+            let mut failing = false;
             loop {
+                let poll = poll();
+                // Said once per spell. Failed polls hold the panel on its
+                // last state, which looks like a hang with nothing to say
+                // why.
+                match &poll {
+                    Poll::Failed(why) => {
+                        if !std::mem::replace(&mut failing, true) {
+                            eprintln!("desktop: {why}; keeping the last away state");
+                        }
+                    }
+                    Poll::Answer(_) | Poll::Gone => {
+                        if std::mem::take(&mut failing) {
+                            let now = match poll {
+                                Poll::Gone => "is gone",
+                                _ => "is answering again",
+                            };
+                            eprintln!("desktop: Hyprland {now}");
+                        }
+                    }
+                }
                 let was = a.load(Ordering::Relaxed);
-                a.store(next(was, poll()), Ordering::Relaxed);
+                a.store(next(was, poll), Ordering::Relaxed);
                 thread::sleep(POLL);
             }
         });
@@ -68,9 +89,9 @@ enum Poll {
     /// Hyprland isn't running: no socket, or none taking connections
     /// (another compositor, or Hyprland exited and left its socket behind).
     Gone,
-    /// Hyprland is there, but asking it failed: a reply too slow, cut off
-    /// or garbled. Says nothing about the desktop.
-    Failed,
+    /// Hyprland is there, but asking it failed, and why: a reply too slow,
+    /// cut off or garbled. Says nothing about the desktop.
+    Failed(String),
 }
 
 /// Whether the desktop is away now, given whether it was and what this
@@ -81,7 +102,7 @@ fn next(was: bool, poll: Poll) -> bool {
     match poll {
         Poll::Answer(away) => away,
         Poll::Gone => false,
-        Poll::Failed => was,
+        Poll::Failed(_) => was,
     }
 }
 
@@ -102,7 +123,8 @@ fn poll() -> Poll {
 /// Asks each of Hyprland's command sockets in turn about the monitors,
 /// until one answers.
 fn poll_at(sockets: &[PathBuf]) -> Poll {
-    let mut listening = false;
+    // Why the last socket with something behind it gave no answer.
+    let mut failed = None;
     for path in sockets {
         let stream = match UnixStream::connect(path) {
             Ok(stream) => stream,
@@ -110,17 +132,17 @@ fn poll_at(sockets: &[PathBuf]) -> Poll {
             Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
                 continue;
             }
-            Err(_) => {
-                listening = true;
+            Err(e) => {
+                failed = Some(format!("connecting to {}: {e}", path.display()));
                 continue;
             }
         };
-        listening = true;
-        if let Ok(monitors) = monitors(stream, path) {
-            return Poll::Answer(is_away(&monitors));
+        match monitors(stream, path) {
+            Ok(monitors) => return Poll::Answer(is_away(&monitors)),
+            Err(e) => failed = Some(format!("{e:#}")),
         }
     }
-    if listening { Poll::Failed } else { Poll::Gone }
+    failed.map_or(Poll::Gone, Poll::Failed)
 }
 
 fn monitors(stream: UnixStream, path: &Path) -> Result<Vec<Monitor>> {
@@ -176,14 +198,15 @@ mod tests {
 
     #[test]
     fn a_lock_holds_until_hyprland_answers_or_is_gone() {
+        let failed = || Poll::Failed("no reply".into());
         let mut away = next(false, Poll::Answer(true));
         for _ in 0..100 {
-            away = next(away, Poll::Failed);
+            away = next(away, failed());
         }
         assert!(away, "still locked after any number of failed polls");
         assert!(!next(away, Poll::Answer(false)));
         assert!(!next(away, Poll::Gone), "Hyprland exited");
-        assert!(!next(false, Poll::Failed), "never locked, never away");
+        assert!(!next(false, failed()), "never locked, never away");
     }
 
     #[test]
@@ -200,7 +223,10 @@ mod tests {
 
         // Takes the connection but never replies.
         let _stuck = UnixListener::bind(socket("stuck")).unwrap();
-        assert_eq!(poll_at(&[socket("dead"), socket("stuck")]), Poll::Failed);
+        let Poll::Failed(why) = poll_at(&[socket("dead"), socket("stuck")]) else {
+            panic!("a socket that never replies is a failed poll");
+        };
+        assert!(why.contains("stuck"), "says which socket: {why}");
 
         // Answers, after the others have failed.
         let live = UnixListener::bind(socket("live")).unwrap();
