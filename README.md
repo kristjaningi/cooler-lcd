@@ -254,15 +254,16 @@ defaults are used.
   credentials of its own; the numbers are as fresh as the bar's (every 15
   minutes by default, `omarchy bar set omarchy.agents refreshIntervalSec 300
   --json` for 5). The big bar's notch marks where an even spend across the
-  window would be by now, and records older than 45 minutes are dimmed with
-  their age (`src/screens/usage/`).
+  window would be by now. Limits older than 45 minutes, or that the last
+  refresh couldn't update, are dimmed, and for the agent on top their age
+  replaces the time until the reset (`src/screens/usage/`).
 - **Radar:** aircraft from [adsb.fi](https://adsb.fi)'s open data API
   (community ADS-B receivers, no key, personal non-commercial use), polled
-  every 10 s only while the radar is on screen, backing off on errors and
-  slowing down on HTTP 429. ([adsb.lol](https://adsb.lol) serves the same
-  format but kept rate limiting it.) Positions are dead reckoned
-  between polls, so blips glide at the 15 fps animation rate. The static
-  scope, rings and map are drawn once per theme. Text layouts and glyph
+  every 10 s while the radar is on screen and for 20 s after, backing off
+  on errors and slowing down on HTTP 429. ([adsb.lol](https://adsb.lol)
+  serves the same format but kept rate limiting it.) Positions are dead
+  reckoned between polls, so blips glide at the 15 fps animation rate. The
+  static scope, rings and map are drawn once per theme. Text layouts and glyph
   coverage are cached with bounded memory; moving labels use eight subpixel
   phases per axis (at most 1/16 pixel rounding). Coastline from Natural
   Earth, runways from OurAirports (`src/screens/radar/`).
