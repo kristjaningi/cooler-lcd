@@ -9,6 +9,9 @@ use super::{PX_PER_NM, View, adsb, geo};
 const MAX_ALT: i32 = 4000;
 /// How far out the approach is followed, and the centerline drawn, nm.
 pub const APPROACH_NM: f32 = 10.0;
+/// How far past the threshold a landing can still be in the air, nm: the
+/// touchdown zone, which is this or the runway's first third if shorter.
+const TOUCHDOWN_NM: f32 = 0.5;
 /// How far past the far end of the runway a climb-out is followed, nm.
 const CLIMB_OUT_NM: f32 = 6.0;
 /// Distance off the centerline still counted as on it, nm.
@@ -90,7 +93,12 @@ pub fn classify(ac: &adsb::Aircraft, (x, y): (f32, f32), view: &View) -> Option<
         if lateral > LATERAL_NM {
             return None;
         }
-        let kind = if !climbing && (-APPROACH_NM..=d.length_nm).contains(&along) {
+        // An arrival is normally on the ground, with no altitude, by the
+        // end of the touchdown zone. In the air further down the runway is
+        // a departure lifting off, whose climb may not show in its first
+        // reports.
+        let touchdown = TOUCHDOWN_NM.min(d.length_nm / 3.0);
+        let kind = if !climbing && (-APPROACH_NM..=touchdown).contains(&along) {
             Kind::Arrival
         } else if climbing && (0.0..=d.length_nm + CLIMB_OUT_NM).contains(&along) {
             Kind::Departure

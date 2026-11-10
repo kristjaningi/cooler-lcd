@@ -1137,6 +1137,24 @@ mod tests {
         };
         assert_eq!(at(&crossing), None, "not aligned with the runway");
 
+        // Over the numbers, about to touch down.
+        let flaring = adsb::Aircraft {
+            lat: 63.966,
+            lon: -22.6054,
+            alt: Some(200),
+            vrate: Some(-200),
+            ..finals.clone()
+        };
+        assert_eq!(at(&flaring), Some(arrival));
+        // Just off the ground halfway down 01, before its climb shows: a
+        // landing would be on the ground by here.
+        let lifting_off = adsb::Aircraft {
+            lat: 63.978,
+            vrate: None,
+            ..flaring.clone()
+        };
+        assert_eq!(at(&lifting_off), None, "not landing");
+
         // Past the far end of 01, climbing out northbound.
         let departure = adsb::Aircraft {
             lat: 64.02,
