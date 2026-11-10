@@ -26,7 +26,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Local, TimeDelta};
 
 use config::Config;
@@ -111,7 +111,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    // Not `env::args`, which panics on an argument that isn't UTF-8, such
+    // as a file named in another encoding.
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.into_string())
+        .collect::<Result<_, _>>()
+        .map_err(|arg| anyhow!("argument {arg:?} isn't valid UTF-8"))?;
     if let Some(verb) = args.get(1)
         && control::VERBS.contains(&verb.as_str())
     {
