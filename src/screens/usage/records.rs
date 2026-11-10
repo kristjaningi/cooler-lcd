@@ -96,11 +96,15 @@ impl Agent {
     /// How old the limits are when they can't be trusted: the collector
     /// says it couldn't refresh them, or they're older than `STALE`.
     pub fn stale_age(&self, now: DateTime<Utc>) -> Option<Duration> {
-        let age = self.fetched_at.and_then(|t| (now - t).to_std().ok());
+        let age = self.age(now);
         if self.limits_stale {
             return Some(age.unwrap_or_default());
         }
         age.filter(|age| *age > STALE)
+    }
+
+    fn age(&self, now: DateTime<Utc>) -> Option<Duration> {
+        self.fetched_at.and_then(|t| (now - t).to_std().ok())
     }
 }
 
@@ -156,8 +160,16 @@ impl Records {
     pub fn alerts(&mut self, now: DateTime<Utc>) -> Vec<String> {
         self.agents()
             .iter()
-            // Old numbers are shown, dimmed, but don't take over.
-            .filter(|a| a.stale_age(now).is_none())
+            // Old numbers are shown, dimmed, but don't take over. Old by
+            // age, not by the flag: a limit over the line stays there until
+            // it resets, so one failed refresh flagging the limits stale
+            // mustn't drop the alert, to raise it again as new when a
+            // refresh works.
+            .filter(|a| match a.age(now) {
+                Some(age) => age <= STALE,
+                // Flagged, with no saying when they were fetched.
+                None => !a.limits_stale,
+            })
             .flat_map(|a| {
                 a.limits
                     .iter()
@@ -277,7 +289,8 @@ fn agent(r: Record) -> Agent {
             .limits_fetched_at
             .filter(|&ms| ms > 0.0)
             .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
-            .or_else(|| time(r.updated_at.as_deref())),
+            // The record's own time, unless it says the limits are older.
+            .or_else(|| time(r.updated_at.as_deref()).filter(|_| !r.limits_stale)),
         limits_stale: r.limits_stale,
         limits,
         status,
@@ -571,10 +584,12 @@ mod tests {
 
         // Without the fields (Codex), the record's own time counts.
         assert!(record("").stale_age(now).is_none());
+        // Unless the limits are flagged: then it's when fetching failed.
+        assert_eq!(record(r#""limitsStale":true,"#).fetched_at, None);
     }
 
     #[test]
-    fn stale_limits_dont_take_over() {
+    fn old_limits_dont_take_over_but_a_failed_refresh_keeps_its_alert() {
         let now = Utc::now();
         let mut records = Records {
             dir: PathBuf::from("/nonexistent"),
@@ -595,9 +610,26 @@ mod tests {
                 resets: None,
             }],
         };
-        assert_eq!(records.alerts(now).len(), 1);
+        let alerts = records.alerts(now);
+        assert_eq!(alerts.len(), 1);
+        // The next refresh fails: the same limits, flagged stale.
         records.agents[0].limits_stale = true;
-        assert!(records.alerts(now).is_empty());
+        let later = now + chrono::Duration::minutes(15);
+        assert_eq!(records.alerts(later), alerts, "nothing new to take over");
+        assert!(
+            records.agents[0].stale_age(later).is_some(),
+            "though dimmed"
+        );
+        // Refreshes keep failing until the limits are too old to go by.
+        let old = now + chrono::Duration::minutes(46);
+        assert!(records.alerts(old).is_empty());
+        records.agents[0].limits_stale = false;
+        assert!(records.alerts(old).is_empty(), "flagged or not");
+        // Flagged with no fetch time, they could be any age.
+        records.agents[0].fetched_at = None;
+        assert_eq!(records.alerts(old).len(), 1, "nothing against them");
+        records.agents[0].limits_stale = true;
+        assert!(records.alerts(old).is_empty());
     }
 
     #[test]
