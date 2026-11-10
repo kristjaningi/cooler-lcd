@@ -51,8 +51,9 @@ struct Monitor {
     dpms_status: bool,
     #[serde(default)]
     disabled: bool,
+    /// Null, not empty, while nothing blocks it: a lone fullscreen window.
     #[serde(default)]
-    solitary_blocked_by: Vec<String>,
+    solitary_blocked_by: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -87,7 +88,8 @@ fn next(was: bool, poll: Poll) -> bool {
 fn is_away(monitors: &[Monitor]) -> bool {
     let locked = monitors
         .iter()
-        .any(|m| m.solitary_blocked_by.iter().any(|r| r == "LOCK"));
+        .flat_map(|m| m.solitary_blocked_by.iter().flatten())
+        .any(|r| r == "LOCK");
     let mut on = monitors.iter().filter(|m| !m.disabled);
     let dark = on.clone().next().is_some() && on.all(|m| !m.dpms_status);
     locked || dark
@@ -230,5 +232,18 @@ mod tests {
         let disabled_off = parse(r#"[{"dpmsStatus":true},{"dpmsStatus":false,"disabled":true}]"#);
         assert!(!is_away(&disabled_off));
         assert!(!is_away(&[]));
+    }
+
+    #[test]
+    fn reads_a_monitor_showing_a_lone_fullscreen_window() {
+        // As Hyprland 0.57 reports one: nothing blocks it, so no list.
+        let solitary = |dpms: bool| {
+            let json = format!(
+                r#"[{{"dpmsStatus":{dpms},"solitary":"55d0c0a0","solitaryBlockedBy":null}}]"#
+            );
+            serde_json::from_str::<Vec<Monitor>>(&json).expect("null blockers")
+        };
+        assert!(!is_away(&solitary(true)));
+        assert!(is_away(&solitary(false)), "dark all the same");
     }
 }
